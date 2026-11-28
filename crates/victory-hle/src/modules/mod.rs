@@ -74,9 +74,5 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
-    #[cfg(windows)]
-    if fidelityfx::serving() {
-        all.push(fidelityfx::module());
-    }
     all
 }

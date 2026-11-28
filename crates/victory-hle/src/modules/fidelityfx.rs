@@ -1,54 +1,48 @@
-//! `amd_fidelityfx_loader_xbox.dll`: AMD FidelityFX's API, served by the
-//! host's PC build of it on the host GPU when the user names a folder that
-//! holds one (`VICTORY_FIDELITYFX_DIR`). Without it, or if it offers no
-//! upscaler for the host GPU, this module stays out of the registry and the
-//! title's own console DLLs run as before.
+//! `amd_fidelityfx_loader_xbox.dll`: the title's FidelityFX API, five
+//! functions over chains of descriptions, each starting with a type id and
+//! the next one's address. With DLSS or frame generation on
+//! (`victory_gpu::streamline`, `VICTORY_DLSS=1`, `VICTORY_FRAMEGEN=1`), the
+//! title's imports of it are bound to the functions here ([`Interpose`]),
+//! which call the title's own DLL for everything except an upscale dispatch
+//! DLSS takes: DLSS then records the upscaling at that place of the title's
+//! command list instead, from the same textures into the same output. With
+//! frame generation alone the title's own upscaling runs and its depth and
+//! motion vectors are noted for the present. Without either switch, or
+//! without Streamline, the imports are bound as before.
 //!
-//! Both builds have the same API (the FidelityFX SDK's, MIT): five functions
-//! over chains of descriptions, each starting with a type id and the next
-//! one's address; contexts are opaque pointers. The console-specific parts
-//! are translated: the backend description names the console device (type
-//! 0x0100_0002; on PC type 2 with the host device), and a dispatch names the
-//! title's command list and resources (their host list and host copies, in
-//! the states the title gives, see `victory_gpu::external`). The rest passes
-//! through unchanged: sizes, flags, jitter, motion-vector scale, camera
-//! values, the resource descriptions, the context. Only the upscaler: other
-//! effects (frame generation) are refused.
+//! The title's upscaler context stays the title's own (its FidelityFX makes
+//! it), so the title's upscaling runs again on any frame DLSS does not take.
+//!
+//! The description layouts are the FidelityFX SDK's API (MIT) as DexNom's fork
+//! reads them (DexNom/VIctory, `crates/victory-hle/src/modules/fidelityfx.rs`,
+//! GPL-3.0-or-later), from which they are ported.
 #![allow(non_snake_case)]
 // Title code calls these through its import table.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ffi::{CStr, c_char, c_void};
-use std::path::Path;
-use std::ptr::{null, null_mut};
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use victory_gpu::object::Object;
-use windows::Win32::Graphics::Direct3D12::ID3D12Device;
-use windows::core::Interface;
+use victory_gpu::streamline::{self, Taken, Upscale, plan::Camera};
+use victory_loader::{ImportResolver, Provenance, Resolution};
+use victory_pe::ImportSymbol;
 
-use crate::{HleModule, hle_export};
-
-/// The PC build's upscaler, which has the five functions itself.
-const DLL: &str = "amd_fidelityfx_upscaler_dx12.dll";
+/// The DLL the title imports the API from (it loads the upscaler itself).
+pub const LOADER_DLL: &str = "amd_fidelityfx_loader_xbox.dll";
 
 // Return codes.
 const OK: u32 = 0;
-const UNKNOWN_TYPE: u32 = 2;
-const NO_PROVIDER: u32 = 4;
 const PARAMETER: u32 = 6;
 
 // Description types.
 const CREATE_UPSCALE: u64 = 0x1_0000;
 const DISPATCH_UPSCALE: u64 = 0x1_0001;
-const CONSOLE_BACKEND: u64 = 0x100_0002;
-const HOST_BACKEND: u64 = 2;
-const GET_VERSIONS: u64 = 4;
-const GET_PROVIDER_VERSION: u64 = 6;
-const MEMORY_USAGE_WITH_DEVICE: u64 = 0x1_0009;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Header {
     kind: u64,
     next: *mut Header,
@@ -57,7 +51,7 @@ struct Header {
 /// An upscaler context: flags, largest render and output sizes, a message
 /// callback.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct CreateUpscale {
     header: Header,
     flags: u32,
@@ -66,17 +60,10 @@ struct CreateUpscale {
     message: usize,
 }
 
-/// The backend description: a device.
-#[repr(C)]
-struct Backend {
-    header: Header,
-    device: *mut c_void,
-}
-
 /// A resource, its description (type, format, sizes, mips, flags, usage)
 /// and the state it is in.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Resource {
     resource: *mut c_void,
     description: [u32; 8],
@@ -84,60 +71,57 @@ struct Resource {
 }
 
 /// One upscaling: the command list, then colour, depth, motion vectors,
-/// exposure, reactive mask, transparency mask and output; then jitter,
-/// motion-vector scale, sizes, sharpening, frame time, pre-exposure, reset,
-/// camera and flags, which pass through.
+/// exposure, reactive mask, transparency mask and output; jitter,
+/// motion-vector scale, sizes, sharpening, frame time (ms), pre-exposure,
+/// reset, camera and flags. (The C `bool`s are read as bytes.)
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct DispatchUpscale {
     header: Header,
     list: *mut c_void,
     resources: [Resource; 7],
-    rest: [u32; 18],
+    jitter: [f32; 2],
+    motion_scale: [f32; 2],
+    render_size: [u32; 2],
+    upscale_size: [u32; 2],
+    enable_sharpening: u8,
+    sharpness: f32,
+    frame_time_delta: f32,
+    pre_exposure: f32,
+    reset: u8,
+    camera_near: f32,
+    camera_far: f32,
+    camera_fov_angle_vertical: f32,
+    view_space_to_meters_factor: f32,
+    flags: u32,
 }
 
 const _: () = assert!(size_of::<CreateUpscale>() == 0x30);
 const _: () = assert!(size_of::<Resource>() == 0x30);
 const _: () = assert!(size_of::<DispatchUpscale>() == 0x1b0);
 
-/// The versions a backend offers: count in and out, ids, names.
-#[repr(C)]
-struct GetVersions {
-    header: Header,
-    create_kind: u64,
-    device: *mut c_void,
-    count: *mut u64,
-    ids: *mut u64,
-    names: *mut *const c_char,
-}
-
-#[repr(C)]
-struct ProviderVersion {
-    header: Header,
-    id: u64,
-    name: *const c_char,
-}
-
 type Create = unsafe extern "C" fn(*mut *mut c_void, *mut Header, *const c_void) -> u32;
 type Destroy = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> u32;
 /// Configure, query and dispatch.
 type Call = unsafe extern "C" fn(*mut *mut c_void, *mut Header) -> u32;
 
-struct Host {
-    create: Create,
-    destroy: Destroy,
-    configure: Call,
-    query: Call,
-    dispatch: Call,
-    device: ID3D12Device,
+/// The title's own functions, by [`NAMES`].
+static ORIGINALS: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
+const NAMES: [&str; 5] = ["ffxCreateContext", "ffxDestroyContext", "ffxConfigure", "ffxQuery", "ffxDispatch"];
+
+/// An upscaler context the title made: its creation flags and largest
+/// sizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Created {
+    flags: u32,
+    max_render: [u32; 2],
+    max_output: [u32; 2],
+    /// Made smaller than asked for the shipping FSR4 (DLSS on): the title's
+    /// own upscaling must not run on it at the size asked.
+    clamped: bool,
 }
 
-// SAFETY: D3D12 devices are free-threaded; the rest is code.
-unsafe impl Send for Host {}
-// SAFETY: as above.
-unsafe impl Sync for Host {}
-
-static HOST: OnceLock<Host> = OnceLock::new();
+static CONTEXTS: Mutex<Option<HashMap<usize, Created>>> = Mutex::new(None);
 
 macro_rules! once {
     ($level:ident, $($arg:tt)*) => {{
@@ -146,374 +130,379 @@ macro_rules! once {
     }};
 }
 
-/// Serves the title's FidelityFX calls with the PC upscaler in `dir`
-/// (`VICTORY_FIDELITYFX_DIR`) if it offers one for the host GPU; else the
-/// title's own DLLs run. Call once, before the import registry is first
-/// used: it holds this module only when serving.
-pub fn use_host_dir(dir: Option<&Path>) {
-    let Some(dir) = dir else {
-        tracing::info!(
-            "no FidelityFX folder (VICTORY_FIDELITYFX_DIR): a title's own FidelityFX DLLs run"
-        );
-        return;
-    };
-    match load(dir) {
-        Ok((host, versions)) => {
-            tracing::info!(folder = %dir.display(), versions, "FidelityFX: the host's upscaler serves the title's");
-            let _ = HOST.set(host);
+/// Binds the title's imports of [`LOADER_DLL`] to the functions here when
+/// DLSS or frame generation is on, keeping what `inner` binds them to (the
+/// title's own DLL) for them to call; otherwise binds as `inner` does.
+pub struct Interpose<'a> {
+    pub inner: &'a dyn ImportResolver,
+}
+
+impl ImportResolver for Interpose<'_> {
+    fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+        let found = self.inner.resolve(dll, symbol);
+        if !dll.eq_ignore_ascii_case(LOADER_DLL) || !streamline::serving() {
+            return found;
         }
-        Err(why) => tracing::warn!(
-            folder = %dir.display(),
-            "FidelityFX: {why}; the title's own DLLs run"
-        ),
-    }
-}
-
-/// Whether the host's FidelityFX serves the title's.
-pub(crate) fn serving() -> bool {
-    HOST.get().is_some()
-}
-
-fn load(dir: &Path) -> Result<(Host, String), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::System::LibraryLoader::{
-        GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
-        LoadLibraryExW,
-    };
-    // The search flags below want a full path.
-    let path = std::path::absolute(dir.join(DLL)).map_err(|e| e.to_string())?;
-    if !path.is_file() {
-        return Err(format!("no {DLL} there"));
-    }
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-    // Its own folder and System32 only, never the current folder.
-    let search = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32;
-    // SAFETY: a NUL-terminated path to the user's FidelityFX build.
-    let module = unsafe { LoadLibraryExW(wide.as_ptr(), null_mut(), search) };
-    if module.is_null() {
-        return Err(format!(
-            "{DLL} did not load ({})",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let find = |name: &CStr| {
-        // SAFETY: a loaded module and a NUL-terminated name.
-        unsafe { GetProcAddress(module, name.as_ptr().cast()) }
-            .map(|f| f as *const c_void)
-            .ok_or_else(|| format!("{DLL} has no {}", name.to_string_lossy()))
-    };
-    let device = victory_gpu::external::host_device().ok_or("there is no host GPU")?;
-    // SAFETY: the API's exports, with its signatures.
-    let host = unsafe {
-        Host {
-            create: std::mem::transmute::<*const c_void, Create>(find(c"ffxCreateContext")?),
-            destroy: std::mem::transmute::<*const c_void, Destroy>(find(c"ffxDestroyContext")?),
-            configure: std::mem::transmute::<*const c_void, Call>(find(c"ffxConfigure")?),
-            query: std::mem::transmute::<*const c_void, Call>(find(c"ffxQuery")?),
-            dispatch: std::mem::transmute::<*const c_void, Call>(find(c"ffxDispatch")?),
-            device,
+        match (&found, symbol) {
+            (&Resolution::Found { address, .. }, ImportSymbol::Name { name, .. }) => match interpose(name, address) {
+                Some(ours) => Resolution::Found { address: ours, provenance: Provenance::Hle },
+                None => found,
+            },
+            _ => found,
         }
-    };
-    let versions = versions(&host)?;
-    Ok((host, versions))
-}
-
-/// The upscaler versions the host DLL offers for the host GPU, by name; an
-/// error if none.
-fn versions(host: &Host) -> Result<String, String> {
-    let mut count = 0u64;
-    let mut query = GetVersions {
-        header: Header {
-            kind: GET_VERSIONS,
-            next: null_mut(),
-        },
-        create_kind: CREATE_UPSCALE,
-        device: host.device.as_raw(),
-        count: &mut count,
-        ids: null_mut(),
-        names: null_mut(),
-    };
-    // SAFETY: a version query naming the host device.
-    let code = unsafe { (host.query)(null_mut(), &mut query.header) };
-    if code != OK || count == 0 {
-        return Err(format!(
-            "it offers no upscaler for the host GPU (code {code})"
-        ));
     }
-    let mut names = vec![null::<c_char>(); count as usize];
-    query.names = names.as_mut_ptr();
-    // SAFETY: as above, with room for `count` names.
-    unsafe { (host.query)(null_mut(), &mut query.header) };
-    Ok(names
-        .iter()
-        .filter(|n| !n.is_null())
-        // SAFETY: NUL-terminated names the DLL keeps.
-        .map(|&n| unsafe { CStr::from_ptr(n) }.to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join(", "))
 }
 
-/// Puts the host backend after the title's upscaler description, in place
-/// of the console's backend that follows it (where the title puts it);
-/// anywhere else the console's is left for the host DLL to ignore, ours
-/// coming first.
-fn link(upscale: &mut CreateUpscale, backend: &mut Backend) {
-    let after = upscale.header.next;
-    // SAFETY: the title's chain.
-    backend.header.next = match unsafe { after.as_ref() } {
-        Some(h) if h.kind == CONSOLE_BACKEND => h.next,
-        _ => after,
-    };
-    backend.header.kind = HOST_BACKEND;
-    upscale.header.next = &raw mut backend.header;
+/// Keeps `original` as the title's `name` and gives ours, if we have one.
+fn interpose(name: &str, original: usize) -> Option<usize> {
+    let i = NAMES.iter().position(|n| *n == name)?;
+    ORIGINALS[i].store(original, Relaxed);
+    let ours = [
+        ffxCreateContext as *const () as usize,
+        ffxDestroyContext as *const () as usize,
+        ffxConfigure as *const () as usize,
+        ffxQuery as *const () as usize,
+        ffxDispatch as *const () as usize,
+    ][i];
+    tracing::info!(name, original = format_args!("{original:#x}"), "FidelityFX: the title's import goes through ours (DLSS / frame generation)");
+    Some(ours)
 }
 
-/// A FidelityFX resource state as the host resource state it means (as the
-/// PC backend reads it); `None` for generic read and indirect arguments,
-/// which a host texture cannot be in.
-fn host_state(state: u32) -> Option<u32> {
-    Some(match state {
-        0x1 | 0x80 => 0,  // common, present
-        0x2 => 0x8,       // unordered access
-        0x4 => 0x40,      // compute read
-        0x8 => 0x80,      // pixel read
-        0xc => 0xc0,      // both
-        0x10 => 0x800,    // copy source
-        0x20 => 0x400,    // copy destination
-        0x100 => 0x4,     // render target
-        0x200 => 0x10,    // depth write
-        _ => return None, // generic read, indirect arguments
-    })
+fn original(i: usize) -> Option<*const ()> {
+    let address = ORIGINALS[i].load(Relaxed);
+    (address != 0).then_some(address as *const ())
 }
 
-extern "C" fn ffxCreateContext(
-    context: *mut *mut c_void,
-    desc: *mut Header,
-    memory: *const c_void,
-) -> u32 {
-    let Some(host) = HOST.get() else {
-        return NO_PROVIDER;
-    };
-    if context.is_null() || desc.is_null() {
-        return PARAMETER;
-    }
+fn contexts<T>(f: impl FnOnce(&mut HashMap<usize, Created>) -> T) -> T {
+    let mut contexts = CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+    f(contexts.get_or_insert_with(HashMap::new))
+}
+
+/// The largest output the title's shipping FSR4 accepts: it carries only the
+/// fixed-resolution quality shader tables of the Series S (1280x720 in,
+/// 1920x1080 out). Other sizes fail the context's creation ("Shipping FSR4
+/// configuration mismatch: maxUpscaleSize must be 1920x1080", "maxRenderSize
+/// must be 1280x720 for a tight fixed-resolution allocation or 1920x1080 for
+/// the legacy allocation"), and the title, which does not look at the result,
+/// divides by zero at its first upscaling (2026-11-26, 4070 SUPER).
+const SHIPPING_MAX_OUTPUT: [u32; 2] = [1920, 1080];
+const SHIPPING_MAX_RENDER: [u32; 2] = [1280, 720];
+
+/// The sizes the title's shipping FSR4 accepts for a context, if `render` and
+/// `output` are not those: (render, output).
+fn shipping_sizes(render: [u32; 2], output: [u32; 2]) -> Option<([u32; 2], [u32; 2])> {
+    ((render, output) != (SHIPPING_MAX_RENDER, SHIPPING_MAX_OUTPUT)).then_some((SHIPPING_MAX_RENDER, SHIPPING_MAX_OUTPUT))
+}
+
+extern "C" fn ffxCreateContext(context: *mut *mut c_void, desc: *mut Header, memory: *const c_void) -> u32 {
+    let Some(create) = original(0) else { return PARAMETER };
+    // SAFETY: the title's own function, with its arguments.
+    let call = |desc: *mut Header| unsafe { std::mem::transmute::<*const (), Create>(create)(context, desc, memory) };
     // SAFETY: the title passes a chain of descriptions.
-    let kind = unsafe { (*desc).kind };
-    if kind != CREATE_UPSCALE {
-        once!(
-            warn,
-            kind = format_args!("{kind:#x}"),
-            "FidelityFX: only the upscaler runs on the host; another effect was refused"
-        );
-        return NO_PROVIDER;
+    let upscaler = !desc.is_null() && unsafe { (*desc).kind } == CREATE_UPSCALE;
+    if !upscaler {
+        return call(desc);
     }
     // SAFETY: an upscaler description, by its type.
-    let mut upscale = unsafe { desc.cast::<CreateUpscale>().read() };
-    let mut backend = Backend {
-        header: Header {
-            kind: HOST_BACKEND,
-            next: null_mut(),
-        },
-        device: host.device.as_raw(),
+    let asked = unsafe { desc.cast::<CreateUpscale>().read() };
+    // With DLSS taking the upscalings, the title's own context only has to
+    // exist (for its queries and our bookkeeping): it is made at a size its
+    // shipping tables accept, and DLSS gets the sizes the title asked for.
+    let shipping = streamline::upscaling().then(|| shipping_sizes(asked.max_render, asked.max_output)).flatten();
+    let clamped = shipping.is_some();
+    let code = if let Some((render, output)) = shipping {
+        let mut fitted = asked;
+        fitted.max_render = render;
+        fitted.max_output = output;
+        // SAFETY: the title's description, rewritten for the call and put back.
+        unsafe { desc.cast::<CreateUpscale>().write(fitted) };
+        let code = call(desc);
+        // SAFETY: as above.
+        unsafe { desc.cast::<CreateUpscale>().write(asked) };
+        tracing::info!(
+            asked_render = ?asked.max_render,
+            asked_output = ?asked.max_output,
+            made_render = ?fitted.max_render,
+            made_output = ?fitted.max_output,
+            code,
+            "FidelityFX: the title's upscaler made at a size its shipping FSR4 accepts; DLSS upscales to the size asked"
+        );
+        code
+    } else {
+        call(desc)
     };
-    link(&mut upscale, &mut backend);
-    // SAFETY: a PC chain; the title's later descriptions live for the call.
-    let code = unsafe { (host.create)(context, &mut upscale.header, memory) };
-    if code != OK {
-        tracing::error!(code, render = ?upscale.max_render, output = ?upscale.max_output, flags = format_args!("{:#x}", upscale.flags), "FidelityFX: the host refused the title's upscaler");
+    if code != OK || context.is_null() {
+        // Frame generation without DLSS leaves the upscaling to the title's
+        // own FidelityFX, which is made for the Series S sizes only.
+        if code != OK && !streamline::upscaling() {
+            tracing::error!(
+                code,
+                max_render = ?asked.max_render,
+                max_output = ?asked.max_output,
+                "FidelityFX: the title's own upscaler was not made at these sizes (its shipping FSR4 takes 1280x720 or 1920x1080 in, 1920x1080 out): with frame generation at another output size, set VICTORY_DLSS=1 as well; the title fails at its first upscaling without an upscaler"
+            );
+        }
         return code;
     }
-    let mut version = ProviderVersion {
-        header: Header {
-            kind: GET_PROVIDER_VERSION,
-            next: null_mut(),
-        },
-        id: 0,
-        name: null(),
-    };
-    // SAFETY: a provider query on the context just made.
-    unsafe { (host.query)(context, &mut version.header) };
-    // SAFETY: a NUL-terminated name the DLL keeps, if any.
-    let name = (!version.name.is_null())
-        .then(|| unsafe { CStr::from_ptr(version.name) }.to_string_lossy());
+    // SAFETY: the context was made.
+    let handle = unsafe { *context } as usize;
+    let created = Created { flags: asked.flags, max_render: asked.max_render, max_output: asked.max_output, clamped };
     tracing::info!(
-        provider = name.as_deref().unwrap_or("?"),
-        id = format_args!("{:#x}", version.id),
-        render = ?upscale.max_render,
-        output = ?upscale.max_output,
-        flags = format_args!("{:#x}", upscale.flags),
-        "FidelityFX: upscaler context on the host"
+        context = format_args!("{handle:#x}"),
+        flags = format_args!("{:#x}", created.flags),
+        max_render = ?created.max_render,
+        max_output = ?created.max_output,
+        "FidelityFX: the title made its upscaler"
     );
-    OK
+    contexts(|c| c.insert(handle, created));
+    code
 }
 
 extern "C" fn ffxDestroyContext(context: *mut *mut c_void, memory: *const c_void) -> u32 {
-    // SAFETY: the title passes its context.
-    HOST.get()
-        .map_or(NO_PROVIDER, |h| unsafe { (h.destroy)(context, memory) })
+    let Some(destroy) = original(1) else { return PARAMETER };
+    if !context.is_null() {
+        // SAFETY: the title passes its context.
+        let handle = unsafe { *context } as usize;
+        if contexts(|c| c.remove(&handle)).is_some() {
+            streamline::upscaler_destroyed(handle);
+        }
+    }
+    // SAFETY: the title's own function, with its arguments.
+    unsafe { std::mem::transmute::<*const (), Destroy>(destroy)(context, memory) }
 }
 
-/// Settings (key-value pairs, debug messages) name nothing console-specific.
 extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *mut Header) -> u32 {
-    // SAFETY: the title passes its context and descriptions.
-    HOST.get()
-        .map_or(NO_PROVIDER, |h| unsafe { (h.configure)(context, desc) })
+    let Some(configure) = original(2) else { return PARAMETER };
+    // SAFETY: the title's own function, with its arguments.
+    unsafe { std::mem::transmute::<*const (), Call>(configure)(context, desc) }
 }
 
 extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> u32 {
-    let Some(host) = HOST.get() else {
-        return NO_PROVIDER;
-    };
-    if desc.is_null() {
-        return PARAMETER;
+    let Some(query) = original(3) else { return PARAMETER };
+    if !desc.is_null() {
+        // SAFETY: the title passes a description.
+        let kind = unsafe { (*desc).kind };
+        static SEEN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&kind) && seen.len() < 32 {
+            seen.push(kind);
+            tracing::info!(kind = format_args!("{kind:#x}"), "FidelityFX: the title asks a query of this kind (answered by its own DLL)");
+        }
     }
-    // SAFETY: the title passes a description.
-    let kind = unsafe { (*desc).kind };
-    // These carry the console device.
-    if kind == GET_VERSIONS || kind == MEMORY_USAGE_WITH_DEVICE {
-        once!(
-            warn,
-            kind = format_args!("{kind:#x}"),
-            "FidelityFX: a query naming a device was refused"
-        );
-        return PARAMETER;
-    }
-    // SAFETY: as above.
-    unsafe { (host.query)(context, desc) }
+    // SAFETY: the title's own function, with its arguments.
+    unsafe { std::mem::transmute::<*const (), Call>(query)(context, desc) }
 }
 
 extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
-    let Some(host) = HOST.get() else {
-        return NO_PROVIDER;
-    };
-    if desc.is_null() {
-        return PARAMETER;
+    let Some(dispatch) = original(4) else { return PARAMETER };
+    // SAFETY: the title's own function, with its arguments.
+    let own = || unsafe { std::mem::transmute::<*const (), Call>(dispatch)(context, desc) };
+    if context.is_null() || desc.is_null() {
+        return own();
     }
-    // SAFETY: the title passes a description.
-    let kind = unsafe { (*desc).kind };
+    // SAFETY: the title passes a description and its context.
+    let (kind, handle) = unsafe { ((*desc).kind, *context as usize) };
     if kind != DISPATCH_UPSCALE {
-        once!(
-            warn,
-            kind = format_args!("{kind:#x}"),
-            "FidelityFX: only upscaling runs on the host; a dispatch was refused"
-        );
-        return UNKNOWN_TYPE;
+        return own();
     }
+    let Some(created) = contexts(|c| c.get(&handle).copied()) else {
+        once!(warn, "FidelityFX: an upscale dispatch on a context we did not see made; the title's own runs");
+        return own();
+    };
     // SAFETY: an upscaling, by its type.
-    let mut dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
-    let list = dispatch.list.cast::<Object>().cast_const();
-    // Alive for the call (the list holds them too).
-    let mut textures = Vec::new();
-    for r in dispatch
-        .resources
-        .iter_mut()
-        .filter(|r| !r.resource.is_null())
-    {
-        let wanted = host_state(r.state);
-        let texture = wanted.and_then(|w| {
-            victory_gpu::external::host_texture(list, r.resource.cast::<Object>(), w)
-                .filter(|&(_, state)| state == w)
-        });
-        let Some((texture, _)) = texture else {
-            once!(
-                warn,
-                state = r.state,
-                "FidelityFX: a resource has no host texture in its state; the upscaling did not run"
-            );
-            return PARAMETER;
-        };
-        r.resource = texture.as_raw();
-        textures.push(texture);
+    let d = unsafe { desc.cast::<DispatchUpscale>().read() };
+    first_dispatch(&d, &created);
+    let up = upscale(&d, &created, handle);
+    match streamline::upscale(&up) {
+        Taken::Dlss => OK,
+        Taken::Noted => own(),
+        Taken::No(why) if created.clamped => {
+            // The title's FidelityFX on a context made for 1080p at the
+            // output size asked would read past its tables: no upscaling
+            // this frame (the output keeps the last one) rather than that.
+            refused(why);
+            once!(warn, "FidelityFX: DLSS did not take an upscaling on a context made smaller than asked; none ran");
+            OK
+        }
+        Taken::No(why) => {
+            streamline::forwarded();
+            refused(why);
+            own()
+        }
     }
-    once!(info, formats = ?textures.iter().map(|t| {
-        // SAFETY: a live texture.
-        unsafe { t.GetDesc() }.Format.0
-    }).collect::<Vec<_>>(), "FidelityFX: first upscaling, host formats of its textures");
-    victory_gpu::external::record(list, |host_list| {
-        dispatch.list = host_list.as_raw();
-        // SAFETY: the PC dispatch on host objects; the context is the host's.
-        unsafe { (host.dispatch)(context, &raw mut dispatch.header) }
-    })
-    .unwrap_or(PARAMETER)
 }
 
-pub(crate) fn module() -> HleModule {
-    HleModule {
-        name: "fidelityfx",
-        dlls: &["amd_fidelityfx_loader_xbox.dll"],
-        exports: vec![
-            hle_export!(ffxConfigure),
-            hle_export!(ffxCreateContext),
-            hle_export!(ffxDestroyContext),
-            hle_export!(ffxDispatch),
-            hle_export!(ffxQuery),
-        ],
+/// Each reason the title's own upscaling ran instead, once.
+fn refused(why: &'static str) {
+    static SEEN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&why) {
+        seen.push(why);
+        tracing::warn!("FidelityFX: the title's own upscaling runs: {why}");
+    }
+}
+
+/// The first upscale dispatch, all of it.
+fn first_dispatch(d: &DispatchUpscale, created: &Created) {
+    once!(
+        info,
+        render = ?d.render_size,
+        output = ?d.upscale_size,
+        max_render = ?created.max_render,
+        max_output = ?created.max_output,
+        create_flags = format_args!("{:#x}", created.flags),
+        flags = format_args!("{:#x}", d.flags),
+        jitter = ?d.jitter,
+        motion_vector_scale = ?d.motion_scale,
+        near = d.camera_near,
+        far = d.camera_far,
+        fov = d.camera_fov_angle_vertical,
+        frame_ms = d.frame_time_delta,
+        pre_exposure = d.pre_exposure,
+        reset = d.reset != 0,
+        sharpening = d.enable_sharpening != 0,
+        resources = ?d.resources.iter().map(|r| (r.resource as usize != 0, r.description[1], r.description[2], r.description[3], r.state)).collect::<Vec<_>>(),
+        "FidelityFX: the title's first upscale dispatch (resources: present, format, width, height, state)"
+    );
+}
+
+/// An upscaling in `victory_gpu::streamline`'s terms. The output size is the
+/// context's largest when the dispatch names none (as FidelityFX reads it).
+fn upscale(d: &DispatchUpscale, created: &Created, context: usize) -> Upscale {
+    let output = if d.upscale_size == [0, 0] { created.max_output } else { d.upscale_size };
+    Upscale {
+        context,
+        list: d.list.cast::<Object>().cast_const(),
+        resources: d.resources.map(|r| (r.resource.cast::<Object>().cast_const(), r.state)),
+        camera: Camera {
+            jitter: d.jitter,
+            motion_scale: d.motion_scale,
+            render: d.render_size,
+            output,
+            near: d.camera_near,
+            far: d.camera_far,
+            fov_y: d.camera_fov_angle_vertical,
+            reset: d.reset != 0,
+            flags: created.flags,
+        },
+        pre_exposure: d.pre_exposure,
+        frame_ms: d.frame_time_delta,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::offset_of;
+    use std::ptr::null_mut;
 
-    fn header(kind: u64, next: *mut Header) -> Header {
-        Header { kind, next }
+    #[test]
+    fn descriptions_lay_out_as_the_sdk() {
+        assert_eq!(offset_of!(CreateUpscale, flags), 0x10);
+        assert_eq!(offset_of!(CreateUpscale, max_output), 0x1c);
+        assert_eq!(offset_of!(Resource, state), 0x28);
+        assert_eq!(offset_of!(DispatchUpscale, list), 0x10);
+        assert_eq!(offset_of!(DispatchUpscale, resources), 0x18);
+        assert_eq!(offset_of!(DispatchUpscale, jitter), 0x168);
+        assert_eq!(offset_of!(DispatchUpscale, render_size), 0x178);
+        assert_eq!(offset_of!(DispatchUpscale, upscale_size), 0x180);
+        assert_eq!(offset_of!(DispatchUpscale, enable_sharpening), 0x188);
+        assert_eq!(offset_of!(DispatchUpscale, frame_time_delta), 0x190);
+        assert_eq!(offset_of!(DispatchUpscale, reset), 0x198);
+        assert_eq!(offset_of!(DispatchUpscale, camera_near), 0x19c);
+        assert_eq!(offset_of!(DispatchUpscale, flags), 0x1ac);
     }
 
-    /// The title's chain: upscaler, console backend, version.
-    #[test]
-    fn the_console_backend_becomes_the_hosts() {
-        let mut version = header(0x1_000b, null_mut());
-        let mut console = Backend {
-            header: header(CONSOLE_BACKEND, &raw mut version),
-            device: 0x1234 as *mut c_void,
-        };
-        let mut upscale = CreateUpscale {
-            header: header(CREATE_UPSCALE, &raw mut console.header),
-            flags: 0x29,
-            max_render: [1280, 720],
-            max_output: [1920, 1080],
-            message: 0,
-        };
-        let mut backend = Backend {
-            header: header(0, null_mut()),
-            device: 0x5678 as *mut c_void,
-        };
-        link(&mut upscale, &mut backend);
-        assert_eq!(upscale.header.next, &raw mut backend.header);
-        assert_eq!(backend.header.kind, HOST_BACKEND);
-        assert_eq!(backend.header.next, &raw mut version);
-        assert_eq!(backend.device, 0x5678 as *mut c_void);
-        // Without a console backend right after it, ours goes in front.
-        let mut upscale = CreateUpscale {
-            header: header(CREATE_UPSCALE, &raw mut version),
-            ..upscale
-        };
-        link(&mut upscale, &mut backend);
-        assert_eq!(backend.header.next, &raw mut version);
+    fn resource(at: usize, state: u32) -> Resource {
+        Resource { resource: at as *mut c_void, description: [1, 10, 2560, 1440, 1, 1, 0, 0], state }
     }
 
-    /// Without the PC build the title's own DLL serves its imports.
+    fn dispatch(output: [u32; 2]) -> DispatchUpscale {
+        DispatchUpscale {
+            header: Header { kind: DISPATCH_UPSCALE, next: null_mut() },
+            list: 0x1000 as *mut c_void,
+            resources: [
+                resource(0x10, 0xc),
+                resource(0x20, 0xc),
+                resource(0x30, 0xc),
+                resource(0, 0),
+                resource(0x50, 0xc),
+                resource(0, 0),
+                resource(0x70, 0x2),
+            ],
+            jitter: [0.25, -0.125],
+            motion_scale: [1706.0, 960.0],
+            render_size: [1706, 960],
+            upscale_size: output,
+            enable_sharpening: 0,
+            sharpness: 0.0,
+            frame_time_delta: 33.3,
+            pre_exposure: 1.5,
+            reset: 1,
+            camera_near: 0.1,
+            camera_far: 5000.0,
+            camera_fov_angle_vertical: 0.9,
+            view_space_to_meters_factor: 1.0,
+            flags: 0,
+        }
+    }
+
+    /// A dispatch reads as the upscaling it names; without an output size
+    /// the context's largest is the output.
     #[test]
-    fn without_the_dll_the_titles_own_runs() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(load(dir.path()).err().unwrap().contains(DLL));
-        assert!(!serving());
-        let symbol = victory_pe::ImportSymbol::Name {
-            hint: 0,
-            name: "ffxCreateContext".into(),
-        };
-        let resolver = crate::HleResolver::new(crate::HostPolicy::none());
+    fn a_dispatch_reads_as_its_upscaling() {
+        let created = Created { flags: 0x29, max_render: [2560, 1440], max_output: [2560, 1440], clamped: false };
+        let up = upscale(&dispatch([2560, 1440]), &created, 0xabc);
+        assert_eq!(up.context, 0xabc);
+        assert_eq!(up.list as usize, 0x1000);
+        assert_eq!(up.resources[streamline::COLOUR], (0x10 as *const Object, 0xc));
+        assert_eq!(up.resources[streamline::EXPOSURE].0 as usize, 0);
+        assert_eq!(up.resources[streamline::OUTPUT], (0x70 as *const Object, 0x2));
+        assert_eq!(up.camera.render, [1706, 960]);
+        assert_eq!(up.camera.output, [2560, 1440]);
+        assert_eq!(up.camera.flags, 0x29);
+        assert!(up.camera.reset && up.camera.depth_inverted());
+        assert_eq!((up.pre_exposure, up.frame_ms), (1.5, 33.3));
+        let up = upscale(&dispatch([0, 0]), &Created { max_output: [1920, 1080], ..created }, 0);
+        assert_eq!(up.camera.output, [1920, 1080]);
+    }
+
+    /// A context at other sizes than the shipping FSR4's is made at those
+    /// (1280x720 in, 1920x1080 out); one at them is left as it is.
+    #[test]
+    fn contexts_are_made_at_the_shipping_sizes() {
+        let shipping = Some(([1280, 720], [1920, 1080]));
+        assert_eq!(shipping_sizes([1706, 960], [2560, 1440]), shipping);
+        assert_eq!(shipping_sizes([2560, 1440], [2560, 1440]), shipping);
+        assert_eq!(shipping_sizes([1280, 720], [2560, 1440]), shipping);
+        assert_eq!(shipping_sizes([1280, 720], [1920, 1080]), None);
+    }
+
+    struct Fixed;
+    impl ImportResolver for Fixed {
+        fn resolve(&self, dll: &str, _: &ImportSymbol) -> Resolution {
+            if dll.eq_ignore_ascii_case(LOADER_DLL) {
+                Resolution::Found { address: 0x1234, provenance: Provenance::Title }
+            } else {
+                Resolution::Missing
+            }
+        }
+    }
+
+    /// Without Streamline the title's imports bind as before; the names we
+    /// serve are the API's five.
+    #[test]
+    fn without_streamline_the_titles_own_binds() {
+        let name = |n: &str| ImportSymbol::Name { hint: 0, name: n.into() };
+        let interposed = Interpose { inner: &Fixed };
         assert_eq!(
-            resolver.classify("amd_fidelityfx_loader_xbox.dll", &symbol),
-            None
+            interposed.resolve("AMD_FIDELITYFX_LOADER_XBOX.DLL", &name("ffxDispatch")),
+            Resolution::Found { address: 0x1234, provenance: Provenance::Title }
         );
-    }
-
-    #[test]
-    fn resource_states_read_as_the_pc_backend_reads_them() {
-        assert_eq!(host_state(0xc), Some(0xc0));
-        assert_eq!(host_state(0x2), Some(0x8));
-        assert_eq!(host_state(0x200), Some(0x10));
-        assert_eq!(host_state(0x14), None);
+        assert_eq!(interposed.resolve("other.dll", &name("ffxDispatch")), Resolution::Missing);
+        assert_eq!(interpose("ffxGetVersion", 1), None);
+        assert!(interpose("ffxQuery", 0x5678).is_some());
+        assert_eq!(original(3), Some(0x5678 as *const ()));
+        ORIGINALS[3].store(0, Relaxed);
     }
 }

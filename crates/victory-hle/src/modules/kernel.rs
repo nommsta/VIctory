@@ -7,7 +7,7 @@
 // API would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ffi::{CStr, c_void};
+use std::ffi::{CStr, c_char, c_void};
 
 use crate::{HleModule, HostPolicy, hle_export, registry, runtime};
 
@@ -85,8 +85,7 @@ fn title_path(module: *mut c_void) -> Option<String> {
 
 /// `GetModuleFileName`'s contract: copy with a NUL; if it does not fit,
 /// truncate to the buffer, report `ERROR_INSUFFICIENT_BUFFER` and return
-/// the buffer size. A name that fits clears the last error, as the host
-/// does: titles tell a truncated name from a whole one by it.
+/// the buffer size.
 fn copy_truncated<T: Copy + Default>(text: &[T], out: &mut [T]) -> u32 {
     let Some(room) = out.len().checked_sub(1) else {
         host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
@@ -99,11 +98,8 @@ fn copy_truncated<T: Copy + Default>(text: &[T], out: &mut [T]) -> u32 {
         host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
         return out.len() as u32;
     }
-    host::set_last_error(ERROR_SUCCESS);
     n as u32
 }
-
-const ERROR_SUCCESS: u32 = 0;
 
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
@@ -351,15 +347,92 @@ fn refuse(file: &str) {
     static REFUSED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let file = file.to_ascii_lowercase();
     let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
-    if refused.contains(&file) {
-        return;
+    if !refused.contains(&file) {
+        tracing::warn!(dll = file, "a host DLL outside the host policy: refused");
+        refused.push(file);
     }
-    refused.push(file.clone());
-    drop(refused);
-    tracing::warn!(dll = file, from = %host::callers(), "a host DLL outside the host policy: refused");
 }
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+
+/// The title's argument list: the program, then what was given after `--`.
+/// The host's own would be ours (`victory run <exe> ...`), and the title
+/// looks at fixed places in it (`-skipToIIS` only as the first argument).
+struct TitleArgv {
+    count: std::cell::UnsafeCell<i32>,
+    list: std::cell::UnsafeCell<*mut *mut c_char>,
+}
+
+// SAFETY: never written here after it was made; the title's C runtime start
+// reads it once, on one thread.
+unsafe impl Send for TitleArgv {}
+// SAFETY: as above.
+unsafe impl Sync for TitleArgv {}
+
+/// Kept for the whole run: the title holds on to the pointers.
+fn title_argv(program: &str, args: &[String]) -> TitleArgv {
+    let list: Vec<*mut c_char> = std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .filter_map(|a| std::ffi::CString::new(a).ok())
+        .map(std::ffi::CString::into_raw)
+        .collect();
+    let count = list.len() as i32;
+    // `argv[argc]` is null.
+    let list: Box<[*mut c_char]> = list.into_iter().chain(Some(std::ptr::null_mut())).collect();
+    TitleArgv {
+        count: count.into(),
+        list: Box::leak(list).as_mut_ptr().into(),
+    }
+}
+
+fn argv() -> &'static TitleArgv {
+    static ARGV: std::sync::OnceLock<TitleArgv> = std::sync::OnceLock::new();
+    ARGV.get_or_init(|| {
+        // The program's name stays what the host says (as it was before).
+        let program = std::env::args_os().next().unwrap_or_default();
+        let args = runtime::title_args();
+        tracing::info!(?args, "the title's arguments");
+        title_argv(&program.to_string_lossy(), args)
+    })
+}
+
+/// See [`TitleArgv`].
+pub extern "C" fn __p___argc() -> *mut i32 {
+    argv().count.get()
+}
+
+/// See [`TitleArgv`].
+pub extern "C" fn __p___argv() -> *mut *mut *mut c_char {
+    argv().list.get()
+}
+
+/// The title's thread priorities, but for the lowest two, which become
+/// "below normal". Six of the title's threads run at "idle", the streaming
+/// pager's among them; on the console they have what the rest of the title
+/// leaves of its cores. A PC's processors are also wanted by other programs
+/// and by our own workers (sixteen when pipelines are made): with every
+/// one of them busy such a thread ran once in four seconds or so, when the
+/// host's scheduler took pity, and the loading that waits for it with it
+/// (run stream-3: loads seen to be done 1.1 s late on average, 4.8 s at
+/// worst). `VICTORY_TITLE_PRIORITIES=0`: as the title sets them.
+fn title_priority(asked: i32) -> i32 {
+    const IDLE: i32 = -15;
+    const LOWEST: i32 = -2;
+    const BELOW_NORMAL: i32 = -1;
+    match asked {
+        IDLE..=LOWEST => BELOW_NORMAL,
+        other => other,
+    }
+}
+
+/// [`title_priority`].
+pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
+    static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let as_set = *AS_SET.get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
+    let priority = if as_set { priority } else { title_priority(priority) };
+    // SAFETY: the title passes a thread handle.
+    unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
+}
 
 pub(crate) fn module() -> HleModule {
     HleModule {
@@ -374,6 +447,8 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-crt-runtime-*",
         ],
         exports: vec![
+            hle_export!(__p___argc),
+            hle_export!(__p___argv),
             hle_export!(GetModuleHandleW),
             hle_export!(GetModuleHandleA),
             hle_export!(GetModuleFileNameW),
@@ -393,6 +468,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(SetThreadPriority),
         ],
     }
 }
@@ -607,6 +683,24 @@ mod host {
 mod tests {
     use super::*;
 
+    /// The title's idle and lowest threads run below normal; the others as
+    /// it sets them.
+    #[test]
+    fn no_title_thread_waits_for_idle_processors() {
+        let given: Vec<i32> = [-15, -2, -1, 0, 1, 2, 15].into_iter().map(title_priority).collect();
+        assert_eq!(given, [-1, -1, -1, 0, 1, 2, 15]);
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+        std::thread::spawn(|| {
+            // SAFETY: plain calls on this thread.
+            let thread = unsafe { GetCurrentThread() };
+            assert_eq!(SetThreadPriority(thread, -15), 1);
+            // SAFETY: as above.
+            assert_eq!(unsafe { GetThreadPriority(thread) }, -1);
+        })
+        .join()
+        .unwrap();
+    }
+
     #[test]
     fn title_images_report_their_original_path() {
         let base = 0x7000_0000_0000;
@@ -626,48 +720,27 @@ mod tests {
         assert_eq!(&small, &[b'C', b':', b'\\', 0]);
     }
 
-    /// The host clears the last error when the name fits (titles tell a
-    /// truncated name from a whole one by it, also after a call that
-    /// filled the buffer exactly); a title image's name does the same.
-    #[cfg(windows)]
+    /// The title's arguments come right after the program, and the list ends
+    /// in a null pointer; without any there is only the program.
     #[test]
-    fn a_module_name_that_fits_clears_the_last_error() {
-        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
-        // SAFETY: reads this thread's last error.
-        let last_error = || unsafe { GetLastError() };
-        // SAFETY: sets this thread's last error.
-        let stale = || unsafe { SetLastError(ERROR_INSUFFICIENT_BUFFER) };
-        let (mut wide, mut narrow) = ([0u16; 512], [0u8; 512]);
-
-        // What the host does, for one of its own modules.
-        let kernel32 = host::get_module_handle_w(w("kernel32.dll").as_ptr());
-        stale();
-        assert_ne!(GetModuleFileNameW(kernel32, wide.as_mut_ptr(), 512), 0);
-        assert_eq!(last_error(), 0, "the host, wide");
-        stale();
-        assert_ne!(GetModuleFileNameA(kernel32, narrow.as_mut_ptr(), 512), 0);
-        assert_eq!(last_error(), 0, "the host, narrow");
-
-        let base = 0x7200_0000_0000;
-        runtime::set_image_path(base, std::path::Path::new(r"C:\title\game.exe"));
-        let module = base as *mut c_void;
-        // Too small: the error says so, as before.
-        // SAFETY: this thread's last error.
-        unsafe { SetLastError(0) };
-        assert_eq!(GetModuleFileNameW(module, wide.as_mut_ptr(), 4), 4);
-        assert_eq!(last_error(), ERROR_INSUFFICIENT_BUFFER);
-        // Then with room, the way titles grow their buffer until it fits.
-        assert_eq!(GetModuleFileNameW(module, wide.as_mut_ptr(), 512), 17);
-        assert_eq!(last_error(), 0, "a title image, wide");
-        stale();
-        assert_eq!(GetModuleFileNameA(module, narrow.as_mut_ptr(), 512), 17);
-        assert_eq!(last_error(), 0, "a title image, narrow");
-        // An exact fit is whole too (17 characters and the NUL).
-        stale();
-        assert_eq!(GetModuleFileNameA(module, narrow.as_mut_ptr(), 18), 17);
-        assert_eq!(last_error(), 0);
-        assert_eq!(GetModuleFileNameA(module, narrow.as_mut_ptr(), 17), 17);
-        assert_eq!(last_error(), ERROR_INSUFFICIENT_BUFFER);
+    fn the_title_gets_its_own_arguments() {
+        let read = |made: &TitleArgv| {
+            // SAFETY: made above, kept for the whole run.
+            unsafe {
+                let (count, list) = (*made.count.get() as usize, *made.list.get());
+                assert!((*list.add(count)).is_null());
+                (0..count)
+                    .map(|i| CStr::from_ptr(*list.add(i)).to_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let some = title_argv("victory.exe", &["-skipToIIS".into(), "-x=1".into()]);
+        assert_eq!(read(&some), ["victory.exe", "-skipToIIS", "-x=1"]);
+        assert_eq!(read(&title_argv("victory.exe", &[])), ["victory.exe"]);
+        // What the title is given: the same list every time.
+        assert_eq!(__p___argc(), __p___argc());
+        // SAFETY: as above.
+        unsafe { assert_eq!((*__p___argc(), (**__p___argv()).is_null()), (1, false)) };
     }
 
     fn w(text: &str) -> Vec<u16> {

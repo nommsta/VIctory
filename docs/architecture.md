@@ -23,12 +23,7 @@
 
 Shaders are translated when the title creates a pipeline, from the bytes it
 passes, wherever it loaded them from (executable, archive, memory).
-Converting them ahead of time from files (`victory translate --cache`) is
-only a warm-up: it fills the same cache, under the same key. With
-`--pipelines` it also makes the host pipelines of the title's shader pack
-into the pipeline library, from the creation streams the engine would pass
-(`victory-game` builds them, `victory-gpu` reads them as it reads the
-title's), so a run finds them under the names it gives them itself.
+Converting them ahead of time from files is only a warm-up.
 
 ## Crates
 
@@ -42,7 +37,7 @@ title's), so a run finds them under the names it gives them itself.
 | `victory-shader` | Xbox shader containers → host shaders |
 | `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), BCPack, audio codecs |
 | `victory-pipeline` | converter trait, content-addressed cache |
-| `victory-game` | Grand Theft Auto VI-specific formats, build identities, hooks |
+| `victory-game` | the title-specific formats, build identities, hooks |
 | `apps/victory` | command-line front end |
 | `xtask` | asset-policy check, git hooks |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |
@@ -92,10 +87,7 @@ does not map title DLLs; `victory run` without `--execute` does).
 instruction per machine instruction. `victory_shader::structure` then
 removes EXEC: lane masks become per-lane booleans, wave-wide mask tests
 become per-lane branches, and vector instructions keep a guard only where
-a lane can reach them with its EXEC bit clear. `victory_shader::range::build`
-runs both, again where a bound on the index of a register-relative move
-(`v_movrel*`) is proven on the per-lane form, so the move names only the
-registers it can reach. `victory_shader::resource`
+a lane can reach them with its EXEC bit clear. `victory_shader::resource`
 traces each descriptor and scalar memory address to the root parameter it
 comes from (table, heap, root descriptor or constant). A descriptor a
 waterfall loop reads from the first lane (`v_readfirstlane_b32`) is traced

@@ -78,7 +78,21 @@ impl HostPolicy {
         if !self.allows(dll) {
             return None;
         }
-        imp::resolve(dll, symbol)
+        let address = imp::resolve(dll, symbol)?;
+        // The title's copies of memory look where they write.
+        #[cfg(windows)]
+        if let ImportSymbol::Name { name, .. } = symbol {
+            let ours = victory_gpu::titlewrite::import(name, address);
+            if ours != address {
+                return Some(ours);
+            }
+        }
+        // With a timeline asked for, what threads wait with is wrapped.
+        #[cfg(all(windows, feature = "diagnostics"))]
+        if let ImportSymbol::Name { name, .. } = symbol {
+            return Some(victory_gpu::timeline::import(name, address));
+        }
+        Some(address)
     }
 }
 

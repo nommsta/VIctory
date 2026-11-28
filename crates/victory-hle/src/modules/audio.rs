@@ -12,7 +12,7 @@
 //! Mixed audio leaves through the host's WASAPI, which titles and
 //! middleware reach through COM like on PC. fmod's console build sets up
 //! the coprocessor inside `System_Create` and waits there for its first
-//! command to be acknowledged; Grand Theft Auto VI uses only XMA contexts.
+//! command to be acknowledged; the title uses only XMA contexts.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -114,6 +114,11 @@ fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
     heap.blocks
         .insert(ptr as usize, Block { size, apu, layout });
     heap.by_apu.insert(apu, ptr as usize);
+    // The big ones are named in the log: they are the title's audio memory
+    // given out of our allocator, which the memory line counts as ours.
+    if size >= 32 << 20 {
+        tracing::info!(mb = size >> 20, at = ?ptr, "audio memory for the title from our allocator");
+    }
     Some((ptr, apu))
 }
 
@@ -512,7 +517,16 @@ fn pump(context: Context, voice: &mut Voice) {
         return;
     }
     while context.field(1, 31, 1) == 1 {
-        if voice.pcm.len() < SAMPLES_PER_BLOCK && !decode(context, voice) {
+        // A skipped frame or an input boundary can advance the decoder without
+        // producing samples. Publish only complete blocks, except the final
+        // padded tail. Limit empty steps so a broken looping voice cannot hold
+        // its lock or stall other voices for the whole decoding pass.
+        for _ in 0..8 {
+            if voice.pcm.len() >= SAMPLES_PER_BLOCK || !decode(context, voice) {
+                break;
+            }
+        }
+        if voice.pcm.is_empty() || (voice.pcm.len() < SAMPLES_PER_BLOCK && !voice.ended) {
             return;
         }
         // The write block is the title's too: taken modulo the ring before
@@ -544,12 +558,21 @@ fn pump(context: Context, voice: &mut Voice) {
 /// Decodes the next frame of the current input into `voice.pcm`; false
 /// when there is nothing left to decode.
 fn decode(context: Context, voice: &mut Voice) -> bool {
+    let valid = context.field(0, 20, 2);
     if voice.ended {
-        return false;
+        // The title can refill either input while the context stays enabled.
+        // Flush the previous tail once and leave the ring idle until a valid
+        // buffer is published. The decoder resets its overlap when flushed.
+        if valid == 0 {
+            return false;
+        }
+        voice.ended = false;
+        if context.field(2, 26, 5) == INPUT_INVALID {
+            context.set_field(2, 26, 6, 0);
+        }
     }
     let channels = context.channels();
     let mut current = context.field(4, 31, 1);
-    let valid = context.field(0, 20, 2);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
             // Out of input: the overlap tail, then nothing.

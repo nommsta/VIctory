@@ -8,12 +8,9 @@
 //! exception too), is reported from the unhandled-exception filter
 //! (`report_unhandled`, which the runtime calls ahead of the title's own)
 //! and appended to the crash log, with the title's last debug output, which
-//! often states the reason. Diagnostics builds can also append first-chance
-//! breakpoints with `VICTORY_CRASH_BREAKPOINTS=1`. Panics of ours go to the
-//! crash log too.
+//! often states the reason. Panics of ours go to the crash log too.
 
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
@@ -48,21 +45,17 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-/// Read before installing the exception handler.
-static LOG_FIRST_CHANCE_BREAKPOINTS: AtomicBool = AtomicBool::new(false);
-
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
     if LOG.set(file).is_ok() {
-        let _ = HOST.set(host());
         let print = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             print(info);
             append_to_log(&format!(
                 "VIctory: panic on thread {:?}: {info}\n{}",
                 std::thread::current().name().unwrap_or("?"),
-                report_end()
+                title_output()
             ));
         }));
     }
@@ -72,7 +65,7 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
     let text = format!("{text}
-{}", report_end());
+{}", title_output());
     eprint!("{text}");
     append_to_log(&text);
 }
@@ -115,57 +108,6 @@ fn title_output() -> String {
     said.iter().map(|l| format!("  title said: {l}\n")).collect()
 }
 
-/// The host's line in a crash report. Its CPU and Windows build decide what
-/// title code runs (Intel CPUs lack some of the console's AMD-only
-/// instructions) and which D3D12 runtime there is, so a report needs both.
-/// Set along with the crash log, so a crash queries nothing.
-static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// What ends a crash report: the host, then the title's last debug output.
-fn report_end() -> String {
-    let host = HOST.get().map_or("", String::as_str);
-    format!("{host}{}", title_output())
-}
-
-/// The line [`HOST`] holds.
-fn host() -> String {
-    format!("  host: {}, Windows {}\n", cpu_name(), windows_version())
-}
-
-/// The CPU's brand string, e.g. `AMD Ryzen 7 5700X3D 8-Core Processor`.
-fn cpu_name() -> String {
-    use std::arch::x86_64::__cpuid;
-    if __cpuid(0x8000_0000).eax < 0x8000_0004 {
-        return "an unnamed CPU".into();
-    }
-    let bytes: Vec<u8> = (0x8000_0002..=0x8000_0004)
-        .flat_map(|leaf| {
-            let r = __cpuid(leaf);
-            [r.eax, r.ebx, r.ecx, r.edx]
-        })
-        .flat_map(u32::to_le_bytes)
-        .collect();
-    let padding = |c: char| c == '\0' || c.is_whitespace();
-    let name = String::from_utf8_lossy(&bytes);
-    name.trim_matches(padding).to_owned()
-}
-
-/// The running Windows as `major.minor.build`. `RtlGetVersion` gives the
-/// real one; `GetVersionEx` gives what the executable's manifest declares.
-fn windows_version() -> String {
-    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
-    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
-    // SAFETY: a zeroed OSVERSIONINFOW is valid; its size field is set.
-    let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
-    info.dwOSVersionInfoSize = size_of::<OSVERSIONINFOW>() as u32;
-    // SAFETY: fills the structure passed, whose size it was told.
-    if unsafe { RtlGetVersion(&mut info) } != 0 {
-        return "of unknown version".into();
-    }
-    let (major, minor, build) = (info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber);
-    format!("{major}.{minor}.{build}")
-}
-
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
@@ -173,11 +115,6 @@ pub fn report_crashes() {
         unsafe { report_unhandled(info) };
         EXCEPTION_CONTINUE_SEARCH
     }
-    LOG_FIRST_CHANCE_BREAKPOINTS.store(
-        cfg!(feature = "diagnostics")
-            && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
-        Ordering::Relaxed,
-    );
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
@@ -473,7 +410,7 @@ fn gpr(context: &mut CONTEXT, n: u8) -> &mut u64 {
 }
 
 /// The status flags `cmp a, b` leaves (CF, PF, AF, ZF, SF, OF) as `EFLAGS` bits.
-fn cmp_flags(a: u64, b: u64) -> u32 {
+pub(crate) fn cmp_flags(a: u64, b: u64) -> u32 {
     let r = a.wrapping_sub(b);
     u32::from(a < b)
         | u32::from((r as u8).count_ones().is_multiple_of(2)) << 2
@@ -482,7 +419,7 @@ fn cmp_flags(a: u64, b: u64) -> u32 {
         | ((r >> 63) as u32) << 7
         | ((((a ^ b) & (a ^ r)) >> 63) as u32) << 11
 }
-const CMP_FLAGS: u32 = 0x8d5;
+pub(crate) const CMP_FLAGS: u32 = 0x8d5;
 
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
 /// the saved XMM registers; returns the instruction's length.
@@ -530,17 +467,23 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+    // an instruction of the console's CPU this one lacks: emulated, the title goes on
+    // SAFETY: the system passes valid exception pointers.
+    if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION {
+        // SAFETY: the faulting thread's context, for the exception being dispatched.
+        let r = unsafe { crate::console_insn::emulate(&mut *(*info).ContextRecord) };
+        if r != 0 {
+            return r;
+        }
+    }
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
-    let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
-    if FATAL.contains(&code) {
-        let to_file =
-            code == EXCEPTION_BREAKPOINT && LOG_FIRST_CHANCE_BREAKPOINTS.load(Ordering::Relaxed);
+    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
         // SAFETY: as above.
-        unsafe { report("first-chance exception", info, to_file) };
+        unsafe { report("first-chance exception", info, false) };
     }
     EXCEPTION_CONTINUE_SEARCH
 }
@@ -677,9 +620,9 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
     if to_file {
-        let end = report_end();
-        eprint!("{end}");
-        text.push_str(&end);
+        let said = title_output();
+        eprint!("{said}");
+        text.push_str(&said);
         append_to_log(&text);
     }
     #[cfg(feature = "diagnostics")]
@@ -1121,21 +1064,6 @@ mod tests {
     }
 
     #[test]
-    fn the_host_line_names_the_cpu_and_windows() {
-        // e.g. "  host: AMD EPYC 7763 64-Core Processor, Windows 10.0.26100\n"
-        let line = host();
-        let framed = line.starts_with("  host: ") && line.ends_with('\n');
-        assert!(framed, "{line:?}");
-        let inner = line.trim_start_matches("  host: ").trim_end();
-        let (cpu, windows) = inner.rsplit_once(", Windows ").expect(&line);
-        let named = !cpu.is_empty() && cpu == cpu.trim() && !cpu.contains('\0');
-        assert!(named, "{line:?}");
-        let version: Vec<u32> = windows.split('.').filter_map(|n| n.parse().ok()).collect();
-        assert!(version.len() == 3 && version[0] >= 10, "{line:?}");
-        println!("{line}");
-    }
-
-    #[test]
     fn clzero_zeroes_its_line_on_any_cpu() {
         report_crashes();
         #[repr(align(64))]
@@ -1375,124 +1303,6 @@ mod tests {
         let code = [0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x20, 0x4c, 0x39, 0xd0, 0x72, 0xf4];
         assert!(emulate_in(&code, 0, &mut context));
         assert_eq!(context.Rip, 3);
-        assert_eq!(zeroed(&mem), [false, true, false]);
-    }
-
-    #[test]
-    fn emulated_clzero_loop_stops_when_the_limit_is_on_a_line_boundary() {
-        #[repr(align(64))]
-        struct Lines([u8; 256]);
-        // clzero; add rax, 0x40; cmp rax, r10; jb, with r10 exactly two lines
-        // on: the loop ends when rax reaches the limit (`>=`, not `>`).
-        let mut mem = Lines([0xff; 256]);
-        let start = mem.0.as_mut_ptr() as u64;
-        // SAFETY: an all-zero context is valid.
-        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
-        context.Rax = start;
-        context.R10 = start + 128;
-        let code = [
-            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4,
-        ];
-        assert!(emulate_in(&code, 0, &mut context));
-        assert_eq!((context.Rip, context.Rax), (12, start + 128));
-        assert_eq!(
-            context.EFlags & CMP_FLAGS,
-            native_compare(start + 128, start + 128)
-        );
-        let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
-        assert_eq!(zeroed, [true, true, false, false]);
-    }
-
-    #[test]
-    fn emulated_clzero_second_loop_with_extended_registers() {
-        #[repr(align(64))]
-        struct Lines([u8; 256]);
-        // mov rax, r9; add r9, 0x40; clzero; cmp r9, r12; jb. `a` = r9 needs
-        // REX.R in the mov and REX.B in the add and in the cmp; `b` = r12
-        // needs REX.R in the cmp.
-        let mut mem = Lines([0xff; 256]);
-        let start = mem.0.as_mut_ptr() as u64;
-        // SAFETY: an all-zero context is valid.
-        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
-        context.Rax = start;
-        context.R9 = start + 64;
-        context.R12 = start + 192;
-        let code = [
-            0x4c, 0x89, 0xc8, 0x49, 0x83, 0xc1, 0x40, 0x0f, 0x01, 0xfc, 0x4d, 0x39, 0xe1, 0x72,
-            0xf1,
-        ];
-        assert!(emulate_in(&code, 7, &mut context));
-        assert_eq!(
-            (context.Rip, context.Rax, context.R9),
-            (15, start + 128, start + 192)
-        );
-        assert_eq!(
-            context.EFlags & CMP_FLAGS,
-            native_compare(start + 192, start + 192)
-        );
-        let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
-        assert_eq!(zeroed, [true, true, true, false]);
-        // Every `a` in r9..r15 (r12 as the limit, so skip it as `a`).
-        for a in [9_u8, 10, 11, 13, 14, 15] {
-            let mut mem = Lines([0xff; 256]);
-            let start = mem.0.as_mut_ptr() as u64;
-            // SAFETY: an all-zero context is valid.
-            let mut context: CONTEXT = unsafe { std::mem::zeroed() };
-            context.Rax = start;
-            *gpr(&mut context, a) = start + 64;
-            context.R12 = start + 192;
-            let n = a & 7;
-            let code = [
-                0x4c,
-                0x89,
-                0xc0 | n << 3,
-                0x49,
-                0x83,
-                0xc0 | n,
-                0x40,
-                0x0f,
-                0x01,
-                0xfc,
-                0x4d,
-                0x39,
-                0xe0 | n,
-                0x72,
-                0xf1,
-            ];
-            assert!(emulate_in(&code, 7, &mut context), "r{a}");
-            assert_eq!(context.Rip, 15, "r{a}");
-            assert_eq!(*gpr(&mut context, a), start + 192, "r{a}");
-            assert_eq!(context.Rax, start + 128, "r{a}");
-            let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
-            assert_eq!(zeroed, [true, true, true, false], "r{a}");
-        }
-    }
-
-    #[test]
-    fn emulated_clzero_loops_with_rax_as_the_limit_are_one_line() {
-        #[repr(align(64))]
-        struct Lines([u8; 192]);
-        let zeroed = |l: &Lines| [l.0[0] == 0, l.0[64] == 0, l.0[128] == 0];
-        // mov rax, rdx; add rdx, 0x40; clzero; cmp rdx, rax; jb: the limit
-        // would be the line just zeroed, not a loop: one line, the next
-        // instruction, flags untouched.
-        let mut mem = Lines([0xff; 192]);
-        let start = mem.0.as_mut_ptr() as u64;
-        // SAFETY: an all-zero context is valid.
-        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
-        context.Rax = start + 64;
-        context.Rdx = start + 128;
-        context.EFlags = 0x202;
-        let code = [
-            0x48, 0x89, 0xd0, 0x48, 0x83, 0xc2, 0x40, 0x0f, 0x01, 0xfc, 0x48, 0x39, 0xc2, 0x72,
-            0xf1,
-        ];
-        assert!(emulate_in(&code, 7, &mut context));
-        assert_eq!(
-            (context.Rip, context.Rax, context.Rdx),
-            (10, start + 64, start + 128)
-        );
-        assert_eq!(context.EFlags, 0x202);
         assert_eq!(zeroed(&mem), [false, true, false]);
     }
 

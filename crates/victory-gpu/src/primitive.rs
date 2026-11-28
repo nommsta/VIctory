@@ -1,6 +1,6 @@
 //! Console primitive types the host lacks. A rectangle list gives three
 //! corners per rectangle, the second the one between the other two, and
-//! the hardware adds the fourth at `v0 + v2 - v1` (Grand Theft Auto VI's
+//! the hardware adds the fourth at `v0 + v2 - v1` (the title's
 //! full-screen rectangles come as top left, bottom left, bottom right); on
 //! the host each rectangle becomes two triangles, with the fourth vertex
 //! made from the other three on the CPU.
@@ -11,6 +11,12 @@
 //! [`components`] does not know keep the first vertex's value, and so do
 //! components past the end of the vertex (an element that reaches into the
 //! next one, which the layout allows).
+//!
+//! A pipeline the title makes for rectangles completes them on the GPU
+//! instead, in a geometry stage (`victory_shader::emit::rect_list_gs`):
+//! from the vertex shader's outputs, whichever vertex the corner is, for
+//! direct, indexed and indirect draws alike. This expansion is what is
+//! left for a pipeline that could not get that stage.
 
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both

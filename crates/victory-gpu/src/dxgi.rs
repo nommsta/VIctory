@@ -227,9 +227,50 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// The console's mode list: one 4K mode at 60 Hz (Grand Theft Auto VI looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
-/// shortcut: fixed mode, not the host display's; report the host's rates if
+/// The size of the display the console reports: `VICTORY_DISPLAY_MODE=WxH`
+/// if set (as a console reports the television it is plugged into: a
+/// Series X on a 1080p set lists a 1080p mode), else 3840x2160.
+/// shortcut: not yet the host display's own size by default; make it so
+/// once a title is seen to render for the mode it is given.
+fn display_size() -> (u32, u32) {
+    static SIZE: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let asked = std::env::var("VICTORY_DISPLAY_MODE").ok().and_then(|v| {
+            let (w, h) = v.trim().split_once(['x', 'X'])?;
+            Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+        });
+        let size = match asked {
+            Some((w, h)) if (640..=7680).contains(&w) && (360..=4320).contains(&h) => (w, h),
+            _ => (3840, 2160),
+        };
+        tracing::info!(width = size.0, height = size.1, "display mode reported to the title");
+        size
+    })
+}
+
+/// The refresh rates the mode list offers: 60 Hz, and with
+/// `VICTORY_DISPLAY_REFRESH=<hz>` (61..=240, e.g. 120) that rate too, as a
+/// console on a television with a faster mode lists it. The title looks for
+/// a 120 Hz mode to allow 120 Hz frame intervals.
+fn refresh_rates() -> &'static [u32] {
+    static RATES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    RATES.get_or_init(|| {
+        let mut rates = vec![60];
+        if let Some(hz) = std::env::var("VICTORY_DISPLAY_REFRESH").ok().and_then(|v| v.trim().parse::<u32>().ok()) {
+            if (61..=240).contains(&hz) {
+                rates.push(hz);
+            } else {
+                tracing::warn!(hz, "VICTORY_DISPLAY_REFRESH outside 61..=240: ignored");
+            }
+        }
+        tracing::info!(?rates, "display refresh rates reported to the title");
+        rates
+    })
+}
+
+/// The console's mode list: the display size at each rate of
+/// [`refresh_rates`] (by default one mode at 60 Hz).
+/// shortcut: fixed modes, not the host display's; report the host's rates if
 /// a title paces by them.
 extern "system" fn modes(
     _: This,
@@ -242,25 +283,32 @@ extern "system" fn modes(
     let Some(count) = (unsafe { count.as_mut() }) else {
         return E_INVALIDARG;
     };
+    let rates = refresh_rates();
+    let n = rates.len() as u32;
     if out.is_null() {
-        *count = 1;
+        *count = n;
         return S_OK;
     }
-    if *count < 1 {
+    // As DXGI: what fits is written; a short buffer says so and keeps its count.
+    let fits = (*count).min(n) as usize;
+    let (width, height) = display_size();
+    for (i, &hz) in rates.iter().take(fits).enumerate() {
+        let mode = Mode {
+            width,
+            height,
+            refresh: [hz, 1],
+            format: 0,
+            scanlines: 1, // progressive
+            scaling: 0,
+            flags: 0,
+        };
+        // SAFETY: checked non-null; `i` < the title's `count`.
+        unsafe { out.add(i).write(mode) };
+    }
+    if *count < n {
         return MORE_DATA;
     }
-    *count = 1;
-    let mode = Mode {
-        width: 3840,
-        height: 2160,
-        refresh: [60, 1],
-        format: 0,
-        scanlines: 1, // progressive
-        scaling: 0,
-        flags: 0,
-    };
-    // SAFETY: checked non-null; room for `count` >= 1 modes.
-    unsafe { out.write(mode) };
+    *count = n;
     S_OK
 }
 
