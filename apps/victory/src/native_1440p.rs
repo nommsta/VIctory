@@ -1,11 +1,18 @@
-//! A 2560x1440 SDR display for the supported Series X retail image (the game,
-//! 1.0.2.1): the title presents at 3840x2160 on Series X, its scene drawn at
-//! 2560x1440 and scaled up by its own temporal pass. With 1440p asked for
-//! (`VICTORY_NATIVE_1440P=1`, or `VICTORY_RENDER_1080P=1` for a 1920x1080
-//! scene scaled to 1440p), the image's SDR display mode, the scanout
-//! reservation, the temporal scene scale and the Settings viewport load are
-//! patched before it is mapped: the title then makes a 1440p output, and no
-//! 4K pass runs.
+//! An SDR display of another size (`VICTORY_OUTPUT=WxH`; the old switch
+//! `VICTORY_NATIVE_1440P=1` is 2560x1440) for the supported retail image
+//! (the game, 1.0.2.1): stock, the title presents at 3840x2160 on Series X
+//! (its scene drawn at 2560x1440 and scaled up by its own temporal pass) and
+//! at 1920x1080 on Series S. The image's SDR display mode of the profile,
+//! the scanout reservation, the temporal scene scale and the Settings
+//! viewport load are patched before it is mapped: the title then makes an
+//! output of the size asked.
+//!
+//! The title lists five SDR modes (720p, 936p, 1080p, 1440p, 4K, at
+//! [`MODES`]) on both profiles and takes one by profile, not by the display
+//! mode it is told (run s1440, 2026-11-28: Series S told 2560x1440 still
+//! made a 1080p output). Series X takes the largest entry (4K), which is
+//! written over. Series S takes the largest up to 1080p, so only its stock
+//! 1920x1080 output is accepted (see [`prepare`]).
 //!
 //! Ported from DexNom's fork (DexNom/VIctory, `apps/victory/src/native_1440p.rs`,
 //! GPL-3.0-or-later), its native 1440p part only. Every field is checked
@@ -16,63 +23,107 @@ use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
 use victory_hle::streamline::Mode;
 use victory_loader::PreparedImage;
 
+use crate::Console;
+
 const RETAIL_BUILD: &str = "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93";
-pub(super) const WIDTH: u32 = 2560;
-pub(super) const HEIGHT: u32 = 1440;
-const SDR_MODE: u32 = 0x0615_c100;
-const STOCK_SDR_MODE: [u8; 16] = [0, 15, 0, 0, 112, 8, 0, 0, 60, 0, 0, 0, 1, 0, 0, 0];
+/// The SDR mode list: width, height, refresh, 1 (16 bytes each).
+const MODES: u32 = 0x0615_c0c0;
+const STOCK_MODES: [[u32; 2]; 5] = [[1280, 720], [1664, 936], [1920, 1080], [2560, 1440], [3840, 2160]];
 const SCANOUT_RESERVATION: u32 = 0x0247_ad4a;
 const TEMPORAL_SCALE: u32 = 0x028f_1e7e;
 const UI_VIEWPORT_LOAD: u32 = 0x0580_48d4;
 
-/// Patches `image` for a 2560x1440 output; the scene is drawn at 2560x1440,
-/// or at 1920x1080 with `render_1080p`. Returns the scene's size.
-pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(u32, u32)> {
+/// The SDR mode entry `console` takes, and its stock size.
+fn sdr_mode(console: Console) -> (u32, [u32; 2]) {
+    match console {
+        Console::SeriesX => (MODES + 4 * 16, [3840, 2160]),
+        Console::SeriesS => (MODES + 2 * 16, [1920, 1080]),
+    }
+}
+
+/// Patches `image` for an `output` display on `console`, the scene drawn at
+/// `scene` by the title's own temporal pass (an upscaler sets it instead).
+pub(super) fn prepare(image: &mut PreparedImage, console: Console, output: [u32; 2], scene: [u32; 2]) -> Result<()> {
     ensure!(
         image.original_hash.to_hex().as_str() == RETAIL_BUILD,
-        "1440p output is only known for the retail build {RETAIL_BUILD}"
+        "another output size is only known for the retail build {RETAIL_BUILD}"
     );
-
-    let mode = field::<16>(image, SDR_MODE)?;
-    ensure!(*mode == STOCK_SDR_MODE, "unexpected Series X SDR mode");
-    mode[..4].copy_from_slice(&WIDTH.to_le_bytes());
-    mode[4..8].copy_from_slice(&HEIGHT.to_le_bytes());
+    let [width, height] = output;
+    let (sdr_mode, stock) = sdr_mode(console);
+    // Series S takes the largest mode up to 1080p: with its 1080p entry
+    // written over it takes the 936p one, and the scanout pool's check
+    // fails (title+0x247af2d, 0x540000 left over at 720p, 1440p and 4K
+    // alike; runs s-out*, 2026-11-28). Where that limit is set is not found.
+    ensure!(
+        matches!(console, Console::SeriesX) || output == stock,
+        "a {width}x{height} output is not known on Series S (it outputs 1920x1080 only); use Series X for another size"
+    );
+    // Series X takes the largest mode: every one larger than the output in
+    // either side becomes the output (the 4K one always), so that the largest
+    // is the output (run x-out1080: with the 4K one alone written over, a
+    // 1080p output took the 1440p mode and overran its scanout pool).
+    for (i, size) in STOCK_MODES.iter().enumerate() {
+        let entry = MODES + 16 * i as u32;
+        let mode = field::<16>(image, entry)?;
+        let stock_mode: Vec<u8> = [size[0], size[1], 60, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+        ensure!(mode[..] == stock_mode[..], "unexpected SDR mode {}x{}", size[0], size[1]);
+        let larger = size[0] > width || size[1] > height;
+        if entry == sdr_mode || (matches!(console, Console::SeriesX) && larger) {
+            mode[..4].copy_from_slice(&width.to_le_bytes());
+            mode[4..8].copy_from_slice(&height.to_le_bytes());
+        }
+    }
 
     // Two 64 KiB-aligned, tiled RGBA8 scanout buffers. The reservation is
     // rounded to 2 MiB, matching the title's allocation check.
     let texture = Texture::new(&TextureDesc {
         dimension: Dimension::Tex2d,
-        width: WIDTH,
-        height: HEIGHT,
+        width,
+        height,
         depth_or_array: 1,
         mips: 1,
         format: 28,
         samples: 1,
         swizzle: Swizzle::SW_64KB_D_X,
     })
-    .map_err(|error| anyhow::anyhow!("1440p scanout layout: {error:?}"))?;
+    .map_err(|error| anyhow::anyhow!("{width}x{height} scanout layout: {error:?}"))?;
     let pool_size =
         u32::try_from((texture.size.next_multiple_of(64 * 1024) * 2).next_multiple_of(2 << 20))?;
     let reservation = field::<5>(image, SCANOUT_RESERVATION)?;
-    ensure!(*reservation == [0xb9, 0, 0, 0, 4], "unexpected Series X scanout reservation");
+    ensure!(*reservation == [0xb9, 0, 0, 0, 4], "unexpected scanout reservation");
     reservation[1..].copy_from_slice(&pool_size.to_le_bytes());
 
     let scale = field::<4>(image, TEMPORAL_SCALE)?;
-    ensure!(*scale == (2.0f32 / 3.0).to_le_bytes(), "unexpected Series X temporal scene scale");
-    let (render_width, render_height) = if render_1080p { (1920, 1080) } else { (WIDTH, HEIGHT) };
-    *scale = (render_width as f32 / WIDTH as f32).to_le_bytes();
+    ensure!(*scale == (2.0f32 / 3.0).to_le_bytes(), "unexpected temporal scene scale");
+    *scale = (scene[0] as f32 / width as f32).to_le_bytes();
 
     // Settings lays out its preview panels with a viewport setter of its
-    // own that loads the legacy UI size (3840x2160) even when a 1440p UI
+    // own that loads the legacy UI size (3840x2160) even when a smaller UI
     // surface was made: it reads the selected SDR mode instead.
     let viewport = field::<8>(image, UI_VIEWPORT_LOAD)?;
     ensure!(
         *viewport == [0xc5, 0xfb, 0x10, 0x0d, 0x10, 0xf0, 0x13, 0x05],
         "unexpected Settings viewport size load"
     );
-    let displacement = (SDR_MODE as i32) - (UI_VIEWPORT_LOAD as i32 + 8);
+    let displacement = (sdr_mode as i32) - (UI_VIEWPORT_LOAD as i32 + 8);
     viewport[4..].copy_from_slice(&displacement.to_le_bytes());
-    Ok((render_width, render_height))
+    Ok(())
+}
+
+/// `VICTORY_OUTPUT=WxH`, else 2560x1440 for the old switches
+/// (`VICTORY_NATIVE_1440P=1`, `VICTORY_RENDER_1080P=1`); none: the stock output.
+pub(super) fn asked_output() -> Result<Option<[u32; 2]>> {
+    if let Ok(value) = std::env::var("VICTORY_OUTPUT") {
+        let size = value
+            .trim()
+            .split_once(['x', 'X'])
+            .and_then(|(w, h)| Some([w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?]))
+            .filter(|[w, h]| (640..=7680).contains(w) && (360..=4320).contains(h))
+            .with_context(|| format!("VICTORY_OUTPUT={value}: not WxH between 640x360 and 7680x4320"))?;
+        return Ok(Some(size));
+    }
+    let on = |name: &str| std::env::var(name).as_deref() == Ok("1");
+    Ok((on("VICTORY_NATIVE_1440P") || on("VICTORY_RENDER_1080P")).then_some([2560, 1440]))
 }
 
 /// The title's renderer selection: `mov eax, 6; cmovne eax, ecx` (the
@@ -153,27 +204,45 @@ mod tests {
     use super::*;
 
     /// With the retail executable named by `VICTORY_DISPLAY_PROFILE_TEST_IMAGE`
-    /// (not part of the repository): the four fields hold what a 1440p
-    /// output needs, for both scene sizes; without it, nothing is checked.
+    /// (not part of the repository): the four fields hold what the output
+    /// needs, for each profile and some sizes and scenes; without it,
+    /// nothing is checked.
     #[test]
-    fn patches_the_retail_image_for_1440p() {
+    fn patches_the_retail_image_for_another_output() {
         let Some(path) = std::env::var_os("VICTORY_DISPLAY_PROFILE_TEST_IMAGE") else {
             return;
         };
         let bytes = std::fs::read(path).unwrap();
-        for (render_1080p, scene) in [(false, (2560, 1440)), (true, (1920, 1080))] {
-            let mut image = victory_loader::prepare(&bytes).unwrap();
-            assert_eq!(prepare(&mut image, render_1080p).unwrap(), scene);
-            let mode = *field::<16>(&mut image, SDR_MODE).unwrap();
-            assert_eq!(mode[..4], WIDTH.to_le_bytes());
-            assert_eq!(mode[4..8], HEIGHT.to_le_bytes());
-            let scale = f32::from_le_bytes(*field::<4>(&mut image, TEMPORAL_SCALE).unwrap());
-            assert_eq!((WIDTH as f32 * scale) as u32, scene.0);
-            let load = *field::<8>(&mut image, UI_VIEWPORT_LOAD).unwrap();
-            let disp = i32::from_le_bytes(load[4..].try_into().unwrap());
-            assert_eq!(UI_VIEWPORT_LOAD.wrapping_add(8).wrapping_add_signed(disp), SDR_MODE);
-            // Patched once, the image is no longer the stock one: refused.
-            assert!(prepare(&mut image, render_1080p).is_err());
+        let cases = [([2560, 1440], [2560, 1440]), ([2560, 1440], [1920, 1080]), ([1920, 1080], [1920, 1080]), ([3440, 1440], [3440, 1440])];
+        for console in [Console::SeriesX, Console::SeriesS] {
+            let (sdr_mode, stock) = sdr_mode(console);
+            for (output, scene) in cases {
+                if matches!(console, Console::SeriesS) && output != stock {
+                    let mut image = victory_loader::prepare(&bytes).unwrap();
+                    assert!(prepare(&mut image, console, output, scene).is_err());
+                    continue;
+                }
+                let mut image = victory_loader::prepare(&bytes).unwrap();
+                prepare(&mut image, console, output, scene).unwrap();
+                let mode = *field::<16>(&mut image, sdr_mode).unwrap();
+                assert_eq!(mode[..4], output[0].to_le_bytes());
+                assert_eq!(mode[4..8], output[1].to_le_bytes());
+                if matches!(console, Console::SeriesX) {
+                    // The output is the largest mode.
+                    for i in 0..5 {
+                        let m = *field::<16>(&mut image, MODES + 16 * i).unwrap();
+                        let [w, h] = [0, 4].map(|at| u32::from_le_bytes(m[at..at + 4].try_into().unwrap()));
+                        assert!(w <= output[0] && h <= output[1], "{w}x{h} over {output:?}");
+                    }
+                }
+                let scale = f32::from_le_bytes(*field::<4>(&mut image, TEMPORAL_SCALE).unwrap());
+                assert_eq!((output[0] as f32 * scale).round() as u32, scene[0]);
+                let load = *field::<8>(&mut image, UI_VIEWPORT_LOAD).unwrap();
+                let disp = i32::from_le_bytes(load[4..].try_into().unwrap());
+                assert_eq!(UI_VIEWPORT_LOAD.wrapping_add(8).wrapping_add_signed(disp), sdr_mode);
+                // Patched once, the image is no longer the stock one: refused.
+                assert!(prepare(&mut image, console, output, scene).is_err());
+            }
         }
     }
 
@@ -191,7 +260,7 @@ mod tests {
             for mode in [Mode::Dlaa, Mode::Quality, Mode::Balanced, Mode::Performance, Mode::UltraPerformance] {
                 let mut image = victory_loader::prepare(&bytes).unwrap();
                 if native {
-                    prepare(&mut image, false).unwrap();
+                    prepare(&mut image, Console::SeriesX, [2560, 1440], [2560, 1440]).unwrap();
                 }
                 prepare_upscaler(&mut image, mode).unwrap();
                 assert_eq!(*field::<8>(&mut image, RENDERER_SELECTION).unwrap(), [0xb8, 7, 0, 0, 0, 0x90, 0x90, 0x90]);

@@ -1,8 +1,15 @@
 # DLSS and DLSS Frame Generation (NVIDIA Streamline)
 
-Two switches, both off by default:
+The upscaler is a choice of its own, separate from the console profile:
+`VICTORY_UPSCALER=dlss` (this page) or `VICTORY_UPSCALER=fsr` (the PC
+FidelityFX SDK on the host, see [fsr.md](fsr.md)), at any mode of
+`VICTORY_UPSCALE_MODE`, on Series S and Series X. `VICTORY_DLSS=1` is the old
+name of `VICTORY_UPSCALER=dlss`, and `VICTORY_DLSS_MODE` of
+`VICTORY_UPSCALE_MODE`. Two names that disagree are an error.
 
-- `VICTORY_DLSS=1`: DLSS Super Resolution does the title's FidelityFX upscaling
+Two parts:
+
+- `VICTORY_UPSCALER=dlss` (or `auto` with Streamline set up, the default): DLSS Super Resolution does the title's FidelityFX upscaling
   (its `ffxDispatch`), from the same colour, depth, motion vectors, exposure and
   reactive mask into the same output, at the same place of the title's command
   list.
@@ -54,7 +61,10 @@ later), hardware-accelerated GPU scheduling on (frame generation needs it).
 
 | Variable | Values | Default | What |
 |---|---|---|---|
-| `VICTORY_DLSS` | `1` | off | DLSS in place of the title's FidelityFX upscaling |
+| `VICTORY_UPSCALER` | `auto`, `dlss`, `fsr`, `off` | `auto` | the host upscaler that does the title's FidelityFX upscaling ([fsr.md](fsr.md)); `auto` is DLSS, else FSR, except on Series S at 1080p |
+| `VICTORY_OUTPUT` | `WxH` | the profile's own | the output size, Series X only (Series S outputs 1080p only); `VICTORY_NATIVE_1440P=1` is `2560x1440` |
+| `VICTORY_UPSCALE_MODE` | `native`, `dlaa`, `quality`, `balanced`, `performance`, `ultraperformance` | `quality` | the scene's size, for either upscaler (`native` is `dlaa`); `VICTORY_DLSS_MODE` is used if this is not set |
+| `VICTORY_DLSS` | `1` | off | the same as `VICTORY_UPSCALER=dlss` |
 | `VICTORY_FRAMEGEN` | `1` | off | DLSS Frame Generation on our present; needs `VICTORY_THIN=1` or `VICTORY_ASYNC_SUBMIT=1` (the line of submissions) |
 | `VICTORY_DLSS_MODE` | `dlaa`, `quality`, `balanced`, `performance`, `ultraperformance` | `quality` (`dlaa` with frame generation alone) | the scene's size: 1, 2/3, 0.58, 1/2, 1/3 of the output; the DLSS mode follows the sizes the title then passes |
 | `VICTORY_DLSS_PRESET` | `default`, `j`, `k`, `l`, `m` (`e`, `f` deprecated) | `default` | the DLSS model, for every mode |
@@ -93,8 +103,9 @@ ask `ffxQuery` for it, so a query answer cannot change it. The temporal scene
 scale (title+0x28f1e7e) is set to the same scale, as the stock Series X image
 pairs them (2/3 each). Every patched instruction is checked against the stock
 bytes first (the test `patches_the_upscaler_path` does so with the retail
-executable). Image caches: `images\native-1440p-upscaler-<mode>-sdr` (with
-`VICTORY_NATIVE_1440P=1`), `images\upscaler-<mode>` (otherwise).
+executable). Image caches: `images\native-1440p-upscaler-<mode>-sdr` (Series X
+at 2560x1440), `images\output-<W>x<H>-upscaler-<mode>-sdr` (another output),
+`images\upscaler-<mode>` (the profile's own output).
 
 **At the dispatch.** On the title's thread the dispatch's textures are checked
 (host copies, states a shader can read or write); then a step is put into the

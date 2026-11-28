@@ -56,24 +56,43 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
-    // DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`): Streamline
-    // is loaded before anything of the title or the host GPU, and fails soft;
-    // only if it offers one of them does the title render through its
-    // FidelityFX path, which DLSS takes over (`native_1440p::prepare_upscaler`).
-    let asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+    // The host upscaler (`VICTORY_UPSCALER=dlss|fsr`, old name `VICTORY_DLSS`)
+    // and frame generation (`VICTORY_FRAMEGEN`): Streamline and the FidelityFX
+    // SDK are loaded before anything of the title or the host GPU, and fail
+    // soft; only if one offers an upscaling or frame generation does the title
+    // render through its FidelityFX path, which the host upscaler takes over
+    // (`native_1440p::prepare_upscaler`).
+    let mut asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+    // The title's own upscaler (Series S, its Xbox FSR4) makes a 1080p output
+    // only. Every other case gets a host upscaler when none is named: DLSS,
+    // or FSR where there is no DLSS (`VICTORY_UPSCALER=off` keeps the title's).
+    let output = native_1440p::asked_output()?;
+    asked.auto &= !matches!(console, Console::SeriesS) || output.is_some_and(|o| o != [1920, 1080]);
+    asked.dlss |= asked.auto;
     let available = victory_hle::streamline::init(&asked);
     // `VICTORY_FSR_PATH=1`: the title's FidelityFX path at VICTORY_DLSS_MODE's
     // scale with its own FidelityFX upscaling (no Streamline): DLSS's
     // comparison, and on Series X what that path alone looks like.
     let fsr_path = std::env::var_os("VICTORY_FSR_PATH").is_some_and(|v| v == "1");
-    let upscaler = (available.dlss || available.framegen || fsr_path).then_some(asked.mode);
-    if fsr_path && !asked.any() {
+    let upscaler = (available.dlss || available.fsr || available.framegen || fsr_path).then_some(asked.mode);
+    if fsr_path && !asked.any() && !asked.fsr {
         println!("upscaling      the title's own FidelityFX at the {} scale (VICTORY_FSR_PATH=1)", asked.mode.name());
     }
-    if asked.any() {
+    if asked.any() || asked.fsr {
+        let backend = if available.fsr {
+            "FSR on (PC FidelityFX SDK, version chosen at the first upscaling)"
+        } else if asked.fsr {
+            "FSR asked, not available"
+        } else if available.dlss {
+            "DLSS on"
+        } else if asked.dlss {
+            "DLSS asked, not available"
+        } else {
+            "DLSS off"
+        };
         println!(
-            "upscaling      DLSS {}, frame generation {}{}",
-            if available.dlss { "on" } else if asked.dlss { "asked, not available" } else { "off" },
+            "upscaling      {backend}{}, frame generation {}{}",
+            if asked.auto { " (chosen: no VICTORY_UPSCALER, and the title's own upscales to 1080p on Series S only)" } else { "" },
             if available.framegen { "on" } else if asked.framegen { "asked, not available" } else { "off" },
             upscaler.map(|m| format!(", scene at the {} scale ({})", m.name(), m.scale())).unwrap_or_default()
         );
@@ -86,39 +105,43 @@ pub fn run(
         None => println!("build          unknown ({hash})"),
     }
 
-    // A 1440p output instead of the Series X's 4K one (`native_1440p`): the
-    // patched image goes to a folder of its own, beside the stock one.
+    // An output of another size than the profile's own (`native_1440p`): the
+    // patched image goes to a folder of its own, beside the stock one (the
+    // Series X 1440p folders keep their old names).
     let render_1080p = std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1");
-    let native_1440p = render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1");
-    let images = if native_1440p {
-        anyhow::ensure!(matches!(console, Console::SeriesX), "1440p output needs the Series X profile");
+    let images = if let Some(size @ [w, h]) = output {
         if upscaler.is_some() && render_1080p {
-            println!("display        VICTORY_RENDER_1080P is left out: VICTORY_DLSS_MODE sets the scene's size");
+            println!("display        VICTORY_RENDER_1080P is left out: the upscale mode sets the scene's size");
         }
-        let (w, h) = native_1440p::prepare(&mut prepared, render_1080p && upscaler.is_none())?;
-        // SAFETY: nothing else runs yet; the title and the display mode list
-        // read these later.
+        let scene = if render_1080p && upscaler.is_none() { [1920, 1080] } else { size };
+        native_1440p::prepare(&mut prepared, console, size, scene)?;
+        // SAFETY: nothing else runs yet; the title, the display mode list and
+        // the frontend's viewport fix read these later.
         unsafe {
-            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{}x{}", native_1440p::WIDTH, native_1440p::HEIGHT));
-            std::env::set_var("VICTORY_NATIVE_1440P", "1");
+            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{w}x{h}"));
+            std::env::set_var("VICTORY_OUTPUT", format!("{w}x{h}"));
         }
+        let folder = match console {
+            Console::SeriesX if size == [2560, 1440] => "native-1440p".to_string(),
+            Console::SeriesX => format!("output-{w}x{h}"),
+            Console::SeriesS => format!("output-{w}x{h}-series-s"),
+        };
         match upscaler.map(|mode| (mode, native_1440p::prepare_upscaler(&mut prepared, mode))) {
             Some((mode, Ok(()))) => {
-                let [rw, rh] = mode.render_size([native_1440p::WIDTH, native_1440p::HEIGHT]);
-                println!(
-                    "display        {}x{} SDR, scene {rw}x{rh} through the title's FidelityFX path ({})",
-                    native_1440p::WIDTH,
-                    native_1440p::HEIGHT,
-                    mode.name()
-                );
-                cfg.cache_subdir(&format!("images/native-1440p-upscaler-{}-sdr", mode.name()))?
+                let [rw, rh] = mode.render_size(size);
+                println!("display        {w}x{h} SDR, scene {rw}x{rh} through the title's FidelityFX path ({})", mode.name());
+                cfg.cache_subdir(&format!("images/{folder}-upscaler-{}-sdr", mode.name()))?
             }
             other => {
                 if let Some((_, Err(e))) = other {
                     println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
                 }
-                println!("display        {}x{} SDR, scene {w}x{h}", native_1440p::WIDTH, native_1440p::HEIGHT);
-                cfg.cache_subdir(if render_1080p { "images/1080p-to-1440p-sdr" } else { "images/native-1440p-sdr" })?
+                println!("display        {w}x{h} SDR, scene {}x{}", scene[0], scene[1]);
+                match (folder.as_str(), render_1080p) {
+                    ("native-1440p", true) => cfg.cache_subdir("images/1080p-to-1440p-sdr")?,
+                    (_, true) => cfg.cache_subdir(&format!("images/{folder}-scene-1080p-sdr"))?,
+                    _ => cfg.cache_subdir(&format!("images/{folder}-sdr"))?,
+                }
             }
         }
     } else if let Some(mode) = upscaler {

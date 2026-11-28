@@ -4882,24 +4882,27 @@ impl State {
         crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
     }
 
-    /// With a 1440p output (`VICTORY_NATIVE_1440P=1`, set by the runner when
+    /// With another output size (`VICTORY_OUTPUT=WxH`, set by the runner when
     /// it patches the image for it): the frontend's last triangle is drawn
     /// in output pixels, but some screens project it against the legacy
     /// 3840x2160 canvas; for that draw the viewport is the canvas, so that
-    /// the projection lands on the 2560x1440 target. The scissor and target
-    /// stay 1440p. From DexNom's fork (`State::native_frontend_viewport`,
+    /// the projection lands on the output's target. The scissor and target
+    /// stay the output's. From DexNom's fork (`State::native_frontend_viewport`,
     /// GPL-3.0-or-later).
     fn native_frontend_viewport(&self) -> Option<D3D12_VIEWPORT> {
-        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ENABLED.get_or_init(|| std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1"))
-            || self.depth != 0
-        {
+        static OUTPUT: std::sync::OnceLock<Option<(f32, f32)>> = std::sync::OnceLock::new();
+        let output = *OUTPUT.get_or_init(|| {
+            let value = std::env::var("VICTORY_OUTPUT").ok()?;
+            let (w, h) = value.trim().split_once(['x', 'X'])?;
+            Some((w.trim().parse::<u32>().ok()? as f32, h.trim().parse::<u32>().ok()? as f32))
+        });
+        let Some((width, height)) = output.filter(|_| self.depth == 0) else {
             return None;
-        }
+        };
         let [viewport] = self.viewports.as_slice() else {
             return None;
         };
-        if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height) != (0.0, 0.0, 2560.0, 1440.0) {
+        if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height) != (0.0, 0.0, width, height) {
             return None;
         }
         let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
@@ -4930,7 +4933,7 @@ impl State {
             return None;
         }
         static FIRST: std::sync::Once = std::sync::Once::new();
-        FIRST.call_once(|| tracing::info!("the frontend's legacy 4K projection drawn on the 1440p target"));
+        FIRST.call_once(|| tracing::info!(width, height, "the frontend's legacy 4K projection drawn on the output's target"));
         Some(D3D12_VIEWPORT { Width: 3840.0, Height: 2160.0, ..*viewport })
     }
 

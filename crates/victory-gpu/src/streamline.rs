@@ -1,7 +1,14 @@
 //! NVIDIA DLSS Super Resolution and DLSS Frame Generation through NVIDIA
 //! Streamline, loaded at run time from a folder of the user's; both off by
-//! default.
+//! default. The host upscaler is a choice of its own (`VICTORY_UPSCALER`):
+//! DLSS, or FSR through AMD's PC FidelityFX SDK (`crate::ffx`).
 //!
+//! - `VICTORY_UPSCALER=dlss|fsr`, with `VICTORY_UPSCALE_MODE` (native, dlaa,
+//!   quality, balanced, performance, ultraperformance): the upscaler and the
+//!   render scale. `VICTORY_DLSS=1` is `VICTORY_UPSCALER=dlss`, and
+//!   `VICTORY_DLSS_MODE` is the mode if `VICTORY_UPSCALE_MODE` is not set.
+//!   With frame generation and FSR, FSR upscales and Streamline only notes
+//!   the inputs for the present, as it does with the title's own upscaling.
 //! - `VICTORY_DLSS=1`: the title's FidelityFX upscaling (its `ffxDispatch`,
 //!   served by `victory_hle::modules::fidelityfx`) is done by DLSS instead,
 //!   from the same colour, depth, motion vectors, exposure and reactive mask
@@ -31,6 +38,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub(crate) mod abi;
+#[cfg(test)]
+mod asked_tests;
 pub mod plan;
 
 pub use plan::Mode;
@@ -60,6 +69,15 @@ const VIEWPORT_FG: u32 = 0;
 #[derive(Clone, Debug)]
 pub struct Asked {
     pub dlss: bool,
+    /// No upscaler named (`VICTORY_UPSCALER` unset or `auto`, no
+    /// `VICTORY_DLSS`): the caller may ask for one with `dlss`, and [`init`]
+    /// then takes FSR where Streamline offers no DLSS. `VICTORY_UPSCALER=off`
+    /// clears it.
+    pub auto: bool,
+    /// `VICTORY_UPSCALER=fsr`: FSR does the upscaling (`crate::ffx`).
+    pub fsr: bool,
+    /// `VICTORY_FFX_DIR`: the folder of the FidelityFX SDK's loader.
+    pub ffx_dir: PathBuf,
     pub framegen: bool,
     pub mode: Mode,
     pub preset: u32,
@@ -82,18 +100,46 @@ pub struct Asked {
 }
 
 impl Asked {
-    /// The switches; an unknown mode or preset name is an error.
+    /// The switches; an unknown mode, upscaler or preset name, or two
+    /// switches that disagree, is an error.
     pub fn from_env() -> Result<Self, String> {
-        let var = |name: &str| std::env::var(name).ok();
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// [`Asked::from_env`] over any source of variables.
+    pub fn from_lookup(var: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let on = |name: &str| var(name).is_some_and(|v| v.trim() == "1");
         let framegen = on("VICTORY_FRAMEGEN");
-        let mode = match var("VICTORY_DLSS_MODE") {
-            Some(name) => Mode::from_name(&name).ok_or_else(|| {
-                format!("VICTORY_DLSS_MODE={name}: not one of dlaa, quality, balanced, performance, ultraperformance")
-            })?,
+        let upscaler = match var("VICTORY_UPSCALER").map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("" | "auto" | "none" | "off") => None,
+            Some("dlss") => Some("dlss"),
+            Some("fsr") => Some("fsr"),
+            Some(other) => return Err(format!("VICTORY_UPSCALER={other}: not one of dlss, fsr")),
+        };
+        if upscaler == Some("fsr") && on("VICTORY_DLSS") {
+            return Err("VICTORY_UPSCALER=fsr and VICTORY_DLSS=1 ask for two upscalers".into());
+        }
+        let fsr = upscaler == Some("fsr");
+        let dlss = upscaler == Some("dlss") || (!fsr && on("VICTORY_DLSS"));
+        let auto = !dlss
+            && !fsr
+            && var("VICTORY_UPSCALER").is_none_or(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "" | "auto"));
+        let named = |name: &str| {
+            var(name)
+                .map(|n| {
+                    Mode::from_name(&n)
+                        .ok_or_else(|| format!("{name}={n}: not one of native, dlaa, quality, balanced, performance, ultraperformance"))
+                })
+                .transpose()
+        };
+        let mode = match (named("VICTORY_UPSCALE_MODE")?, named("VICTORY_DLSS_MODE")?) {
+            (Some(a), Some(b)) if a != b => {
+                return Err(format!("VICTORY_UPSCALE_MODE={} and VICTORY_DLSS_MODE={} disagree", a.name(), b.name()));
+            }
+            (Some(mode), _) | (None, Some(mode)) => mode,
             // Frame generation alone keeps the scene at the output's size.
-            None if framegen && !on("VICTORY_DLSS") => Mode::Dlaa,
-            None => Mode::Quality,
+            (None, None) if framegen && !dlss && !fsr => Mode::Dlaa,
+            (None, None) => Mode::Quality,
         };
         let preset = match var("VICTORY_DLSS_PRESET") {
             Some(name) => plan::preset(&name)
@@ -101,7 +147,10 @@ impl Asked {
             None => 0,
         };
         Ok(Asked {
-            dlss: on("VICTORY_DLSS"),
+            dlss,
+            auto,
+            fsr,
+            ffx_dir: var("VICTORY_FFX_DIR").map_or_else(|| PathBuf::from(crate::ffx::DEFAULT_DIR), PathBuf::from),
             framegen,
             mode,
             preset,
@@ -125,6 +174,7 @@ impl Asked {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Available {
     pub dlss: bool,
+    pub fsr: bool,
     pub framegen: bool,
 }
 
@@ -159,8 +209,8 @@ pub const OUTPUT: usize = 6;
 /// What became of an upscaling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Taken {
-    /// DLSS does it: the title's own must not run.
-    Dlss,
+    /// A host upscaler (DLSS or FSR) does it: the title's own must not run.
+    Host,
     /// Only noted for frame generation: the title's own runs.
     Noted,
     /// Neither: the title's own runs. Why, for the log.
@@ -174,7 +224,7 @@ macro_rules! once {
     }};
 }
 
-struct Library(windows_sys::Win32::Foundation::HMODULE);
+pub(crate) struct Library(pub(crate) windows_sys::Win32::Foundation::HMODULE);
 
 impl Drop for Library {
     fn drop(&mut self) {
@@ -299,19 +349,28 @@ static CHECKING: AtomicBool = AtomicBool::new(false);
 /// title's imports are bound. Fails soft: what is not there is logged and
 /// left off.
 pub fn init(asked: &Asked) -> Available {
-    if !asked.any() {
-        return Available::default();
-    }
-    match load_and_init(asked, true) {
-        Ok(available) => available,
-        Err(why) => {
-            tracing::warn!(
+    let fsr = || {
+        crate::ffx::init(&asked.ffx_dir, asked.jitter, asked.mvec)
+            .inspect_err(|why| {
+                tracing::warn!(folder = %asked.ffx_dir.display(), "FSR: {why}; FSR stays off, the title's own upscaling runs");
+            })
+            .is_ok()
+    };
+    let mut available = if asked.fsr { Available { fsr: fsr(), ..Available::default() } } else { Available::default() };
+    if asked.any() {
+        match load_and_init(asked, true) {
+            Ok(loaded) => available = Available { fsr: available.fsr, ..loaded },
+            Err(why) => tracing::warn!(
                 folder = %asked.dir.display(),
                 "Streamline: {why}; DLSS and frame generation stay off, the title's own upscaling and our present run"
-            );
-            Available::default()
+            ),
         }
     }
+    // Chosen for the user: FSR where this GPU or folder gives no DLSS.
+    if asked.auto && asked.dlss && !available.dlss {
+        available.fsr = fsr();
+    }
+    available
 }
 
 fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String> {
@@ -398,7 +457,7 @@ fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String>
         "Streamline loaded (manual hooking, no downloads)"
     );
     let _ = PLAN.set(Plan { asked: asked.clone(), dlss, framegen });
-    Ok(Available { dlss, framegen })
+    Ok(Available { dlss, fsr: false, framegen })
 }
 
 /// Logs whether a feature is supported, with its requirements; whether it is.
@@ -459,7 +518,7 @@ unsafe extern "C" fn log_message(kind: u32, message: *const c_char) {
     }
 }
 
-fn wide(path: &Path) -> Vec<u16> {
+pub(crate) fn wide(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     path.as_os_str().encode_wide().chain([0]).collect()
 }
@@ -479,7 +538,7 @@ fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
 
 /// The Authenticode signature of `path` (NVIDIA signs its DLLs), checked
 /// without going online.
-fn verify_signature(path: &Path) -> Result<(), String> {
+pub(crate) fn verify_signature(path: &Path) -> Result<(), String> {
     use windows_sys::Win32::Security::WinTrust::*;
     let file = wide(path);
     let mut info = WINTRUST_FILE_INFO {
@@ -555,16 +614,16 @@ fn load(path: &Path) -> Result<Sl, String> {
     })
 }
 
-/// Whether the title's FidelityFX calls are to be served (DLSS or frame
+/// Whether the title's FidelityFX calls are to be served (DLSS, FSR or frame
 /// generation is on): `victory_hle` then puts its own in front of them.
 pub fn serving() -> bool {
-    PLAN.get().is_some_and(|p| p.dlss || p.framegen)
+    PLAN.get().is_some_and(|p| p.dlss || p.framegen) || crate::ffx::ready()
 }
 
-/// Whether DLSS is to take the title's upscale dispatches (`VICTORY_DLSS=1`
-/// and Streamline loaded).
+/// Whether a host upscaler is to take the title's upscale dispatches (DLSS
+/// with Streamline loaded, or FSR with the FidelityFX SDK loaded).
 pub fn upscaling() -> bool {
-    PLAN.get().is_some_and(|p| p.dlss)
+    PLAN.get().is_some_and(|p| p.dlss) || crate::ffx::ready()
 }
 
 /// The host device is made: Streamline is given it (`slSetD3DDevice`), the
@@ -774,18 +833,17 @@ fn frame_token(sl: &Sl, index: u32) -> Option<*mut abi::FrameToken> {
     (code == 0 && !token.is_null()).then_some(token)
 }
 
-/// The upscaling `up` asked for on the title's thread: DLSS records it at
-/// this place of the title's list instead (or, with frame generation alone,
-/// its inputs are noted there for the present); the title's own runs
-/// otherwise.
+/// The upscaling `up` asked for on the title's thread: DLSS or FSR records it
+/// at this place of the title's list instead (with frame generation, its
+/// inputs are noted there for the present too, or alone); the title's own
+/// runs otherwise.
 pub fn upscale(up: &Upscale) -> Taken {
-    let Some(plan) = PLAN.get() else {
-        return Taken::No("Streamline is not loaded");
-    };
-    let dlss = plan.dlss && DLSS_READY.load(Acquire);
-    let framegen = plan.framegen && FG_READY.load(Acquire);
-    if !dlss && !framegen {
-        return Taken::No("Streamline has no device yet, or its features did not start");
+    let plan = PLAN.get();
+    let dlss = plan.is_some_and(|p| p.dlss) && DLSS_READY.load(Acquire);
+    let framegen = plan.is_some_and(|p| p.framegen) && FG_READY.load(Acquire);
+    let fsr = crate::ffx::ready();
+    if !dlss && !framegen && !fsr {
+        return Taken::No("no upscaler is ready (Streamline is not loaded, has no device yet, or its features did not start)");
     }
     if [COLOUR, DEPTH, MOTION, OUTPUT].iter().any(|&i| up.resources[i].0.is_null()) {
         return Taken::No("a required texture (colour, depth, motion vectors, output) is missing");
@@ -793,7 +851,7 @@ pub fn upscale(up: &Upscale) -> Taken {
     if up.camera.render.contains(&0) || up.camera.output.contains(&0) {
         return Taken::No("an empty render or output size");
     }
-    if dlss && let Err(why) = validate(up) {
+    if (dlss || fsr) && let Err(why) = validate(up) {
         return Taken::No(why);
     }
     let id = NEXT_ID.fetch_add(1, Relaxed) + 1;
@@ -804,13 +862,17 @@ pub fn upscale(up: &Upscale) -> Taken {
             if framegen {
                 note(host, &up, id);
             }
-            dlss && evaluate(host, &up, id)
+            if dlss {
+                evaluate(host, &up, id)
+            } else {
+                fsr && crate::ffx::evaluate(host, &up)
+            }
         }),
     );
     if !asked {
         return Taken::No("the title's list records nowhere (no host list)");
     }
-    if dlss { Taken::Dlss } else { Taken::Noted }
+    if dlss || fsr { Taken::Host } else { Taken::Noted }
 }
 
 /// The title's own upscaling ran for this reason.
@@ -1092,9 +1154,10 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     Ok(Recorded { mode, optimal: optimal_of_mode(mode), changed, jitter: constants.jitter_offset, mvec_scale: constants.mvec_scale })
 }
 
-/// The title's FidelityFX upscaler `context` is destroyed: what DLSS made
-/// for it goes once submitted work has run.
+/// The title's FidelityFX upscaler `context` is destroyed: what DLSS or FSR
+/// made for it goes once submitted work has run.
 pub fn upscaler_destroyed(context: usize) {
+    crate::ffx::destroy();
     let (Some(sl), true) = (SL.get(), DLSS_READY.load(Acquire)) else { return };
     let _ = context;
     crate::external::finish_submitted();

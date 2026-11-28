@@ -2,8 +2,8 @@
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer that runs an Xbox Series title
 natively on Windows from files **you** supply. foxhound is tuned for **NVIDIA RTX** GPUs: DLSS Super Resolution and
-DLSS Frame Generation in place of the title's own upscaling, the Series X profile at a native 2560x1440, and fewer
-stalls at scene cuts.
+DLSS Frame Generation (or AMD's PC FSR) in place of the title's own upscaling, the Series X profile at a native
+2560x1440 or another output size, and fewer stalls at scene cuts.
 
 > **This repository contains no game files, code or assets.** You need your own legally obtained copy of the
 > title. foxhound is not affiliated with or endorsed by the title's developer or publisher, nor by NVIDIA.
@@ -35,8 +35,8 @@ your own copy of the title.
 3. **Tell it where your copy is.** Copy `victory.example.toml` to `victory.toml` and set `game_dir` to the folder
    that holds `game_scarlett_master.exe`. Keep that folder outside the `foxhound` folder.
 
-4. **Optional, for DLSS:** set up NVIDIA Streamline (see *Set up* below). Without it the game runs with the
-   title's own upscaling.
+4. **Optional, for DLSS or FSR:** set up NVIDIA Streamline or the AMD FidelityFX SDK (see *Set up* below).
+   Without them the game runs with the title's own upscaling.
 
 5. **Start:**
 
@@ -97,8 +97,9 @@ its own compute shaders, which this layer cannot run fast enough yet. An estimat
 for reflections on opaque surfaces and glass. Water reflects the sky only; it does not mirror boats or islands yet.
 
 **Is DLSS on?** With Streamline set up, DLSS Super Resolution (Quality) replaces the title's own upscaler by
-default. Frame Generation is off unless you pass `-FrameGen`. DLSS gets the title's own motion vectors and depth:
-the layer answers the title's FidelityFX upscaler call with DLSS.
+default. Without DLSS, the PC FSR of the FidelityFX SDK does it, if the SDK is set up. Frame Generation is off
+unless you pass `-FrameGen`. DLSS and FSR get the title's own motion vectors and depth: the layer answers the
+title's FidelityFX upscaler call with them. On Series S at 1080p with no host upscaler, the title's own FSR runs.
 
 **I built the shaders and it still stutters at every new scene.** Two causes, both fixed in the launcher now.
 (1) A translation is only found again by a run with the same switches; the older instructions translated with
@@ -185,7 +186,18 @@ The diagnostics build (frame timelines, captures, GPU timing) is optional:
    Check it without the title: `target\release\victory.exe upscaler-check --device` (and `--present` for Frame
    Generation). Details: [docs/dlss.md](docs/dlss.md). Without Streamline the launcher runs without DLSS.
 
-3. **Nothing else.** The launcher translates the shaders and compiles the pipelines before each start
+3. **FSR (optional, for any GPU).** Download the FidelityFX SDK v2.4.0 from
+   <https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK> (the AMD-signed DLLs are in
+   `Kits/FidelityFX/signedbin`), put them **outside** the repository, and point foxhound at that folder:
+
+   ```powershell
+   [Environment]::SetEnvironmentVariable('VICTORY_FFX_DIR', 'D:\sdk\fidelityfx-sdk-v2.4.0\bin', 'User')
+   ```
+
+   FSR is used when DLSS is not available, or always with `VICTORY_UPSCALER=fsr`. On NVIDIA the SDK gives FSR 3.1
+   (FSR 4 is for RDNA only). Details: [docs/fsr.md](docs/fsr.md).
+
+4. **Nothing else.** The launcher translates the shaders and compiles the pipelines before each start
    (`-PrepareOnly` does only that; `-NoPrepare` skips it).
 
 ## Run
@@ -197,7 +209,7 @@ The diagnostics build (frame timelines, captures, GPU timing) is optional:
 | Option | What |
 |---|---|
 | *(none)* | Series X profile, 2560x1440, DLSS Quality (if Streamline is set up), all fixes on |
-| `-Dlss off` / `dlaa` / `balanced` / `performance` | the title's own upscaling, or another DLSS mode |
+| `-Dlss off` / `dlaa` / `balanced` / `performance` | the title's own upscaling (no DLSS or FSR), or another DLSS mode |
 | `-FrameGen` | DLSS Frame Generation (about +1.4 GB of VRAM) |
 | `-SeriesS` | the Series S profile: 1280x720 inside, faster, softer |
 | `-Res 1080to1440` / `4k` | scene at 1080p upscaled by the title / the stock 3840x2160 output |
@@ -227,9 +239,12 @@ Every `VICTORY_...` switch is described in a comment where the code reads it. Th
 
 | Switch | Launcher | What |
 |---|---|---|
-| `VICTORY_DLSS`, `VICTORY_DLSS_MODE` | `quality` | DLSS Super Resolution through the title's FidelityFX dispatch |
+| `VICTORY_UPSCALER` | `auto` | `auto` (DLSS, else FSR), `dlss`, `fsr`, `off` (the title's own); through the title's FidelityFX dispatch. `VICTORY_DLSS=1` is `dlss` |
+| `VICTORY_UPSCALE_MODE` | `quality` | `native`, `dlaa`, `quality`, `balanced`, `performance`, `ultraperformance`; the old `VICTORY_DLSS_MODE` is also read |
+| `VICTORY_FFX_DIR` | not set | folder of the FidelityFX SDK DLLs (FSR) |
+| `VICTORY_OUTPUT` | not set | Series X output size `WxH` (image patched); Series S stays at 1920x1080 |
 | `VICTORY_FRAMEGEN` | off (`-FrameGen`) | DLSS Frame Generation, with the picture before the HUD tagged |
-| `VICTORY_NATIVE_1440P` | on | Series X renders and outputs 2560x1440 (image patched) |
+| `VICTORY_NATIVE_1440P` | on | Series X renders and outputs 2560x1440 (image patched); the same as `VICTORY_OUTPUT=2560x1440` |
 | `VICTORY_SOFT_VIEWS` | `copies` | the title's tiled-heap page mappings kept without Windows views: no freezes at scene cuts |
 | `VICTORY_WC_NO_BACK`, `_MIN_KB` | `1`, `1024` | shader writes into big write-combined copies are not copied back |
 | `VICTORY_AMBIENT`, `VICTORY_AMBIENT_SPECULAR` | `0.8`, `1` | estimates of indirect light and of reflections (no ray tracing) |

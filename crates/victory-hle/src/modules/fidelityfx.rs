@@ -1,17 +1,18 @@
 //! `amd_fidelityfx_loader_xbox.dll`: the title's FidelityFX API, five
 //! functions over chains of descriptions, each starting with a type id and
-//! the next one's address. With DLSS or frame generation on
-//! (`victory_gpu::streamline`, `VICTORY_DLSS=1`, `VICTORY_FRAMEGEN=1`), the
+//! the next one's address. With DLSS, FSR or frame generation on
+//! (`victory_gpu::streamline`, `VICTORY_UPSCALER=dlss|fsr`, `VICTORY_FRAMEGEN=1`), the
 //! title's imports of it are bound to the functions here ([`Interpose`]),
 //! which call the title's own DLL for everything except an upscale dispatch
-//! DLSS takes: DLSS then records the upscaling at that place of the title's
-//! command list instead, from the same textures into the same output. With
+//! a host upscaler takes: DLSS (Streamline) or FSR (the PC FidelityFX SDK,
+//! `victory_gpu::ffx`) then records the upscaling at that place of the
+//! title's command list instead, from the same textures into the same output. With
 //! frame generation alone the title's own upscaling runs and its depth and
 //! motion vectors are noted for the present. Without either switch, or
 //! without Streamline, the imports are bound as before.
 //!
 //! The title's upscaler context stays the title's own (its FidelityFX makes
-//! it), so the title's upscaling runs again on any frame DLSS does not take.
+//! it), so the title's upscaling runs again on any frame a host upscaler does not take.
 //!
 //! The description layouts are the FidelityFX SDK's API (MIT) as DexNom's fork
 //! reads them (DexNom/VIctory, `crates/victory-hle/src/modules/fidelityfx.rs`,
@@ -116,7 +117,7 @@ struct Created {
     flags: u32,
     max_render: [u32; 2],
     max_output: [u32; 2],
-    /// Made smaller than asked for the shipping FSR4 (DLSS on): the title's
+    /// Made smaller than asked for the shipping FSR4 (a host upscaler on): the title's
     /// own upscaling must not run on it at the size asked.
     clamped: bool,
 }
@@ -131,7 +132,7 @@ macro_rules! once {
 }
 
 /// Binds the title's imports of [`LOADER_DLL`] to the functions here when
-/// DLSS or frame generation is on, keeping what `inner` binds them to (the
+/// DLSS, FSR or frame generation is on, keeping what `inner` binds them to (the
 /// title's own DLL) for them to call; otherwise binds as `inner` does.
 pub struct Interpose<'a> {
     pub inner: &'a dyn ImportResolver,
@@ -164,7 +165,7 @@ fn interpose(name: &str, original: usize) -> Option<usize> {
         ffxQuery as *const () as usize,
         ffxDispatch as *const () as usize,
     ][i];
-    tracing::info!(name, original = format_args!("{original:#x}"), "FidelityFX: the title's import goes through ours (DLSS / frame generation)");
+    tracing::info!(name, original = format_args!("{original:#x}"), "FidelityFX: the title's import goes through ours (DLSS / FSR / frame generation)");
     Some(ours)
 }
 
@@ -205,9 +206,10 @@ extern "C" fn ffxCreateContext(context: *mut *mut c_void, desc: *mut Header, mem
     }
     // SAFETY: an upscaler description, by its type.
     let asked = unsafe { desc.cast::<CreateUpscale>().read() };
-    // With DLSS taking the upscalings, the title's own context only has to
-    // exist (for its queries and our bookkeeping): it is made at a size its
-    // shipping tables accept, and DLSS gets the sizes the title asked for.
+    // With a host upscaler taking the upscalings, the title's own context only
+    // has to exist (for its queries and our bookkeeping): it is made at a size
+    // its shipping tables accept, and the host upscaler gets the sizes the
+    // title asked for.
     let shipping = streamline::upscaling().then(|| shipping_sizes(asked.max_render, asked.max_output)).flatten();
     let clamped = shipping.is_some();
     let code = if let Some((render, output)) = shipping {
@@ -225,21 +227,21 @@ extern "C" fn ffxCreateContext(context: *mut *mut c_void, desc: *mut Header, mem
             made_render = ?fitted.max_render,
             made_output = ?fitted.max_output,
             code,
-            "FidelityFX: the title's upscaler made at a size its shipping FSR4 accepts; DLSS upscales to the size asked"
+            "FidelityFX: the title's upscaler made at a size its shipping FSR4 accepts; the host upscaler upscales to the size asked"
         );
         code
     } else {
         call(desc)
     };
     if code != OK || context.is_null() {
-        // Frame generation without DLSS leaves the upscaling to the title's
+        // Frame generation without a host upscaler leaves the upscaling to the title's
         // own FidelityFX, which is made for the Series S sizes only.
         if code != OK && !streamline::upscaling() {
             tracing::error!(
                 code,
                 max_render = ?asked.max_render,
                 max_output = ?asked.max_output,
-                "FidelityFX: the title's own upscaler was not made at these sizes (its shipping FSR4 takes 1280x720 or 1920x1080 in, 1920x1080 out): with frame generation at another output size, set VICTORY_DLSS=1 as well; the title fails at its first upscaling without an upscaler"
+                "FidelityFX: the title's own upscaler was not made at these sizes (its shipping FSR4 takes 1280x720 or 1920x1080 in, 1920x1080 out): with frame generation at another output size, set VICTORY_UPSCALER=dlss or fsr as well; the title fails at its first upscaling without an upscaler"
             );
         }
         return code;
@@ -314,14 +316,14 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     first_dispatch(&d, &created);
     let up = upscale(&d, &created, handle);
     match streamline::upscale(&up) {
-        Taken::Dlss => OK,
+        Taken::Host => OK,
         Taken::Noted => own(),
         Taken::No(why) if created.clamped => {
             // The title's FidelityFX on a context made for 1080p at the
             // output size asked would read past its tables: no upscaling
             // this frame (the output keeps the last one) rather than that.
             refused(why);
-            once!(warn, "FidelityFX: DLSS did not take an upscaling on a context made smaller than asked; none ran");
+            once!(warn, "FidelityFX: the host upscaler did not take an upscaling on a context made smaller than asked; none ran");
             OK
         }
         Taken::No(why) => {

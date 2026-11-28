@@ -69,7 +69,8 @@ if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }
     elseif ($Res -eq '1080to1440') { $settings.VICTORY_RENDER_1080P = '1' }
 }
-if ($Dlss -ne 'off') {
+if ($Dlss -eq 'off') { $settings.VICTORY_UPSCALER = 'off' }
+else {
     $sl = if ($env:VICTORY_STREAMLINE_DIR) { $env:VICTORY_STREAMLINE_DIR } else { 'C:\dev\sdk\streamline-sdk-v2.14.16\bin\x64' }
     if (Test-Path (Join-Path $sl 'sl.interposer.dll')) {
         $settings.VICTORY_DLSS = '1'; $settings.VICTORY_DLSS_MODE = $Dlss; $settings.VICTORY_STREAMLINE_DIR = $sl
